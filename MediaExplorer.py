@@ -142,7 +142,9 @@ def _safe_video_thumb_worker(path, q):
     except Exception:
         q.put(None)
 
-
+# -------------------------------------------------------------------------
+# Thumbworker
+# -------------------------------------------------------------------------
 class ThumbnailWorker(QObject):
     thumbnailReady = pyqtSignal(str, QIcon)
     workerError = pyqtSignal(str, str)  # path, error message
@@ -273,7 +275,7 @@ class ThumbnailWorker(QObject):
                                 pixmap = QPixmap.fromImage(qImg)
 
                     if pixmap and not pixmap.isNull():
-                        # ✅ Use selected thumbnail scaling mode
+                        # Use selected thumbnail scaling mode
                         if self.image_thumb_mode == "zoom":
                             scaled = pixmap.scaled(
                                 THUMB_SIZE,
@@ -614,7 +616,9 @@ class FolderLoader(QObject):
         except Exception as e:
             print(f"[FolderLoader] Cache validation error: {e}")
             return False
-
+# -------------------------------------------------------------------------
+# Smoothlistview
+# -------------------------------------------------------------------------
 
 class SmoothListView(QListView):
     def wheelEvent(self, event):
@@ -624,7 +628,9 @@ class SmoothListView(QListView):
         delta = event.angleDelta().y() / 120  # each notch is 120
         scrollbar.setValue(scrollbar.value() - int(delta * 30))  # 30 px per notch
 
-
+# -------------------------------------------------------------------------
+# Smartfolder Manager
+# -------------------------------------------------------------------------
 class SmartFolderManager(QObject):
     """High-level folder manager that handles the entire loading process"""
 
@@ -6032,3 +6038,4 @@ if __name__ == "__main__":
     splash.finish(window)
 
     sys.exit(app.exec_())
+
