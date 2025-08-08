@@ -8,18 +8,18 @@ simple, fast, and intuitive interface.
 ------------------------------------------------------------
 1. Dependencies
 ------------------------------------------------------------
-1. K-Lite Codec Pack is required to view video files in the program. You can
+a) K-Lite Codec Pack is required to view video files in the program. You can
    download this here: https://codecguide.com/download_kl.htm
 
-2. ensure opencv_world480.dll is in the same directory as .py file (OpenCV 4.8 (or compatible).)
+b) ensure opencv_world480.dll is in the same directory as .py file (OpenCV 4.8 (or compatible).)
 ------------------------------------------------------------
 2. Installation
 ------------------------------------------------------------
 
 To install:
 
-1. Extract the downloaded MediaExplorer folder.
-2. Place it in the top-level folder of your media collection.
+a) Extract the downloaded MediaExplorer folder.
+b) Place it in the top-level folder of your media collection.
 
 This folder becomes the "root folder" and the starting point for the app.
 You cannot navigate above the root folder. To change the root, move the 
