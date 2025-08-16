@@ -9,7 +9,7 @@ simple, fast, and intuitive interface.
 1. Dependencies
 ------------------------------------------------------------
 a) K-Lite Codec Pack is required to view video files in the program. You can
-   download this here: https://codecguide.com/download_kl.htm
+   download this here: https://codecguide.com/download_kl.htm /n
 b) if launching the program from the .py file, ensure "opencv_world480.dll" is in the same directory as .py file (OpenCV 4.8 (or compatible).)
 
 ------------------------------------------------------------
