@@ -88,18 +88,23 @@ l) Exit - Exit the program.
 ------------------------------------------------------------
 
 Q: The program starts in the wrong folder.
+
 A: MediaExplorer uses its own folder as the root. Move the MediaExplorer folder to your preferred root location.
 
 Q: My folder thumbnails are missing.
+
 A: Thumbnails are saved in the 'folder_thumbs' folder. Do not delete or move it. Moving MediaExplorer to another location breaks thumbnail paths.
 
 Q: Large folders load slowly.
+
 A: Initial load may be slow. Thumbnails are cached for faster access next time.
 
 Q: The program crashes while loading.
+
 A: Wait for the spinner to stop before clicking. Heavy interaction during loading may cause instability.
 
 Q: Some thumbnails didn't load.
+
 A: Some files may have timed out. Click 'Update File Thumbs' or re-enter the folder. Some videos may appear black due to dark thumbnail frames.
 
 ------------------------------------------------------------
