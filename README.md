@@ -8,18 +8,18 @@ simple, fast, and intuitive interface.
 ------------------------------------------------------------
 1. Dependencies
 ------------------------------------------------------------
-A) K-Lite Codec Pack is required to view video files in the program. You can
+a) K-Lite Codec Pack is required to view video files in the program. You can
    download this here: https://codecguide.com/download_kl.htm
+b) if launching the program from the .py file, ensure "opencv_world480.dll" is in the same directory as .py file (OpenCV 4.8 (or compatible).)
 
-B) if launching the program from the .py file, ensure "opencv_world480.dll" is in the same directory as .py file (OpenCV 4.8 (or compatible).)
 ------------------------------------------------------------
 2. Installation
 ------------------------------------------------------------
 
 To install:
 
-A) Extract the downloaded MediaExplorer folder.
-B) Place it in the top-level folder of your media collection.
+a) Extract the downloaded MediaExplorer folder.
+b) Place it in the top-level folder of your media collection.
 
 This folder becomes the "root folder" and the starting point for the app.
 You cannot navigate above the root folder. To change the root, move the 
@@ -57,18 +57,18 @@ To go higher in your file path, move the MediaExplorer folder higher.
 
 The toolbar appears at the top in folder view. Left to right:
 
-A) Back Button - Go back to the previous folder.
-B) Settings - Change resolution, clear thumbnail cache, toggle dark/light mode, view About info, exit program.
-C) View - Adjust thumbnail size, image resolution, show/hide names, toolbar, and breadcrumb bar.
-D) Overlay Toggles - Show/hide file and folder names, tags, title placement, and launch icons.
-E) Edit Mode - Rename or delete folders, change folder thumbnail image, enable/disable Launch Mode for .exe files.
-F) Update File Thumbs - Refresh thumbnails in the current folder.
-G) Home - Return to the root folder.
-H) Search Bar - Filter files by name or extension.
-H2) Sort Buttons - Sort files Ascending (default), Descending, Random, or show only Favorites.
-I) New Folder - Create a new folder.
-J) Import Files - Copy files into the current folder.
-K) Exit - Exit the program.
+a) Back Button - Go back to the previous folder.
+b) Settings - Change resolution, clear thumbnail cache, toggle dark/light mode, view About info, exit program.
+c) View - Adjust thumbnail size, image resolution, show/hide names, toolbar, and breadcrumb bar.
+d) Overlay Toggles - Show/hide file and folder names, tags, title placement, and launch icons.
+e) Edit Mode - Rename or delete folders, change folder thumbnail image, enable/disable Launch Mode for .exe files.
+f) Update File Thumbs - Refresh thumbnails in the current folder.
+g) Home - Return to the root folder.
+h) Search Bar - Filter files by name or extension.
+i) Sort Buttons - Sort files Ascending (default), Descending, Random, or show only Favorites.
+j) New Folder - Create a new folder.
+k) Import Files - Copy files into the current folder.
+l) Exit - Exit the program.
 
 ------------------------------------------------------------
 6. FAQ
