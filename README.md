@@ -60,16 +60,27 @@ To go higher in your file path, move the MediaExplorer folder higher.
 The toolbar appears at the top in folder view. Left to right:
 
 a) Back Button - Go back to the previous folder.
+
 b) Settings - Change resolution, clear thumbnail cache, toggle dark/light mode, view About info, exit program.
+
 c) View - Adjust thumbnail size, image resolution, show/hide names, toolbar, and breadcrumb bar.
+
 d) Overlay Toggles - Show/hide file and folder names, tags, title placement, and launch icons.
+
 e) Edit Mode - Rename or delete folders, change folder thumbnail image, enable/disable Launch Mode for .exe files.
+
 f) Update File Thumbs - Refresh thumbnails in the current folder.
+
 g) Home - Return to the root folder.
+
 h) Search Bar - Filter files by name or extension.
+
 i) Sort Buttons - Sort files Ascending (default), Descending, Random, or show only Favorites.
+
 j) New Folder - Create a new folder.
+
 k) Import Files - Copy files into the current folder.
+
 l) Exit - Exit the program.
 
 ------------------------------------------------------------
