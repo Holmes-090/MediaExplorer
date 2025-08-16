@@ -20,6 +20,7 @@ b) if launching the program from the .py file, ensure "opencv_world480.dll" is i
 To install:
 
 a) Extract the downloaded MediaExplorer folder.
+
 b) Place it in the top-level folder of your media collection.
 
 This folder becomes the "root folder" and the starting point for the app.
