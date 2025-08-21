@@ -142,9 +142,7 @@ def _safe_video_thumb_worker(path, q):
     except Exception:
         q.put(None)
 
-# -------------------------------------------------------------------------
-# Thumbworker
-# -------------------------------------------------------------------------
+
 class ThumbnailWorker(QObject):
     thumbnailReady = pyqtSignal(str, QIcon)
     workerError = pyqtSignal(str, str)  # path, error message
@@ -275,7 +273,7 @@ class ThumbnailWorker(QObject):
                                 pixmap = QPixmap.fromImage(qImg)
 
                     if pixmap and not pixmap.isNull():
-                        # Use selected thumbnail scaling mode
+                        # ✅ Use selected thumbnail scaling mode
                         if self.image_thumb_mode == "zoom":
                             scaled = pixmap.scaled(
                                 THUMB_SIZE,
@@ -616,9 +614,7 @@ class FolderLoader(QObject):
         except Exception as e:
             print(f"[FolderLoader] Cache validation error: {e}")
             return False
-# -------------------------------------------------------------------------
-# Smoothlistview
-# -------------------------------------------------------------------------
+
 
 class SmoothListView(QListView):
     def wheelEvent(self, event):
@@ -628,9 +624,7 @@ class SmoothListView(QListView):
         delta = event.angleDelta().y() / 120  # each notch is 120
         scrollbar.setValue(scrollbar.value() - int(delta * 30))  # 30 px per notch
 
-# -------------------------------------------------------------------------
-# Smartfolder Manager
-# -------------------------------------------------------------------------
+
 class SmartFolderManager(QObject):
     """High-level folder manager that handles the entire loading process"""
 
@@ -1053,6 +1047,10 @@ class FullscreenImageViewer(QWidget):
         self.hide_timer.setInterval(3000)
         self.hide_timer.timeout.connect(self._hide_controls)
         QShortcut(QKeySequence("Ctrl+P"), self, activated=self._print_current)
+        
+        # Video preloading system for faster playback
+        self.preload_players = {}  # Cache preloaded video players
+        self.max_preload = 2  # Preload next 2 videos
 
         try:
             self.idx = media_list.index(media_path)
@@ -1344,12 +1342,42 @@ class FullscreenImageViewer(QWidget):
             self.video_widget.installEventFilter(self)
             self.video_widget.setStyleSheet("background-color: black;")
 
-            self.player = QMediaPlayer(self)
+            # Check if we have a preloaded player for this video
+            if path in self.preload_players:
+                self.player = self.preload_players.pop(path)
+                print(f"Using preloaded player for {os.path.basename(path)}")
+            else:
+                self.player = QMediaPlayer(self)
+                # Advanced optimization for faster loading
+                self.player.setNotifyInterval(100)  # Reduce notification overhead
+                
+                # Set initial volume to prevent audio glitches
+                self.player.setVolume(50)
+                
+                # Load media with optimized URL handling
+                media_url = QUrl.fromLocalFile(path)
+                media_content = QMediaContent(media_url)
+                self.player.setMedia(media_content)
+                
+                # Attempt to seek to position 0 to trigger faster initial frame loading
+                QTimer.singleShot(50, lambda: self._trigger_initial_frame_load())
+            
             self.player.setVideoOutput(self.video_widget)
             self.media_layout.addWidget(self.video_widget)
-            self.player.setMedia(QMediaContent(QUrl.fromLocalFile(path)))
+            
+            # Show loading indicator
+            self._show_video_loading_indicator()
+            
+            # Connect status signals for better loading feedback
+            self.player.mediaStatusChanged.connect(self._on_video_status_changed)
+            self.player.positionChanged.connect(self._on_video_position_changed)
+            self.player.error.connect(self._on_video_error)
+            
+            # Start playback
             self.player.play()
-            self.player.mediaStatusChanged.connect(self._loop_video)
+            
+            # Preload next videos for faster navigation
+            self._preload_adjacent_videos()
 
             ctrl = QHBoxLayout()
             ctrl.setContentsMargins(10, 10, 10, 10)
@@ -1535,6 +1563,148 @@ class FullscreenImageViewer(QWidget):
         if st == QMediaPlayer.EndOfMedia:
             self.player.setPosition(0)
             self.player.play()
+    
+    def _show_video_loading_indicator(self):
+        """Show a loading indicator for video playback"""
+        if hasattr(self, 'loading_label'):
+            self.loading_label.show()
+            # Update position in case window was resized
+            self._center_loading_indicator()
+        else:
+            self.loading_label = QLabel("Loading video...", self)
+            self.loading_label.setStyleSheet("""
+                QLabel {
+                    background: rgba(0, 0, 0, 180);
+                    color: white;
+                    padding: 20px;
+                    border-radius: 10px;
+                    font-size: 16px;
+                    font-weight: bold;
+                }
+            """)
+            self.loading_label.setAlignment(Qt.AlignCenter)
+            self.loading_label.resize(200, 60)
+            self._center_loading_indicator()
+            self.loading_label.show()
+            self.loading_label.raise_()  # Ensure it's on top
+    
+    def _center_loading_indicator(self):
+        """Center the loading indicator in the window"""
+        if hasattr(self, 'loading_label'):
+            self.loading_label.move(
+                (self.width() - self.loading_label.width()) // 2,
+                (self.height() - self.loading_label.height()) // 2
+            )
+    
+    def _hide_video_loading_indicator(self):
+        """Hide the loading indicator"""
+        if hasattr(self, 'loading_label'):
+            self.loading_label.hide()
+    
+    def _on_video_status_changed(self, status):
+        """Handle video media status changes for better loading feedback"""
+        from PyQt5.QtMultimedia import QMediaPlayer
+        
+        if status == QMediaPlayer.LoadingMedia:
+            self._show_video_loading_indicator()
+        elif status == QMediaPlayer.BufferedMedia:
+            self._hide_video_loading_indicator()
+            # Ensure playback starts smoothly
+            if hasattr(self, 'player') and self.player.state() != QMediaPlayer.PlayingState:
+                self.player.play()
+        elif status == QMediaPlayer.LoadedMedia:
+            self._hide_video_loading_indicator()
+            # Media is fully loaded, ensure first frame is visible
+            if hasattr(self, 'player'):
+                self.player.setPosition(0)
+                if self.player.state() != QMediaPlayer.PlayingState:
+                    self.player.play()
+        elif status == QMediaPlayer.EndOfMedia:
+            # Loop the video
+            self.player.setPosition(0)
+            self.player.play()
+        elif status == QMediaPlayer.InvalidMedia:
+            self._hide_video_loading_indicator()
+            print(f"Invalid media: {self.path}")
+        elif status == QMediaPlayer.StalledMedia:
+            # Show loading indicator if media stalls
+            self._show_video_loading_indicator()
+    
+    def _on_video_position_changed(self, position):
+        """Handle video position changes - first frame loaded"""
+        if position > 0:
+            self._hide_video_loading_indicator()
+    
+    def _on_video_error(self, error):
+        """Handle video playback errors"""
+        self._hide_video_loading_indicator()
+        print(f"Video error for {self.path}: {error}")
+    
+    def _preload_adjacent_videos(self):
+        """Preload next few videos for faster navigation"""
+        if not hasattr(self, 'media_list') or not self.media_list:
+            return
+            
+        video_exts = (".mp4", ".avi", ".mov", ".webm", ".mkv")
+        
+        # Find next videos to preload
+        for i in range(1, self.max_preload + 1):
+            next_idx = (self.idx + i) % len(self.media_list)
+            next_path = self.media_list[next_idx]
+            
+            if (os.path.splitext(next_path)[1].lower() in video_exts and 
+                next_path not in self.preload_players):
+                self._preload_video(next_path)
+    
+    def _preload_video(self, video_path):
+        """Preload a video file for faster playback"""
+        try:
+            player = QMediaPlayer()
+            # Optimize preloaded player settings
+            player.setNotifyInterval(100)
+            player.setVolume(50)  # Set default volume
+            
+            # Use optimized media content loading
+            media_url = QUrl.fromLocalFile(video_path)
+            media_content = QMediaContent(media_url)
+            player.setMedia(media_content)
+            
+            # Connect a one-time signal to seek to position 0 when loaded
+            def on_media_loaded():
+                if player.mediaStatus() == QMediaPlayer.LoadedMedia:
+                    player.setPosition(0)  # Trigger first frame load
+                    player.mediaStatusChanged.disconnect()  # Disconnect after use
+            
+            player.mediaStatusChanged.connect(on_media_loaded)
+            
+            # Store the preloaded player
+            self.preload_players[video_path] = player
+            print(f"Preloaded video: {os.path.basename(video_path)}")
+            
+            # Limit the number of preloaded videos to prevent memory issues
+            if len(self.preload_players) > self.max_preload * 2:
+                # Remove oldest preloaded video
+                oldest_path = next(iter(self.preload_players))
+                old_player = self.preload_players.pop(oldest_path)
+                old_player.deleteLater()
+                
+        except Exception as e:
+            print(f"Failed to preload video {video_path}: {e}")
+    
+    def _cleanup_preload_players(self):
+        """Clean up preloaded players to free memory"""
+        for player in self.preload_players.values():
+            player.deleteLater()
+        self.preload_players.clear()
+    
+    def _trigger_initial_frame_load(self):
+        """Trigger initial frame loading for faster video start"""
+        if hasattr(self, 'player') and self.player.mediaStatus() == QMediaPlayer.LoadedMedia:
+            # Seek to position 0 to ensure first frame is loaded
+            self.player.setPosition(0)
+        elif hasattr(self, 'player'):
+            # Try again in a bit if media isn't loaded yet
+            QTimer.singleShot(100, self._trigger_initial_frame_load)
 
     def _toggle_play(self):
         if self.player.state() == QMediaPlayer.PlayingState:
@@ -1670,8 +1840,22 @@ class FullscreenImageViewer(QWidget):
             self.close()
 
     def closeEvent(self, e):
+        # Stop all media playback
         if hasattr(self, "player"):
             self.player.stop()
+            self.player.setMedia(QMediaContent())  # Clear media content
+            self.player.deleteLater()  # Schedule for deletion
+        if hasattr(self, "movie"):
+            self.movie.stop()
+            self.movie.deleteLater()
+        
+        # Clean up preloaded video players
+        self._cleanup_preload_players()
+        
+        # Call close callback to notify parent
+        if hasattr(self, '_close_callback') and self._close_callback:
+            self._close_callback()
+            
         super().closeEvent(e)
 
     def _toggle_mini_menu(self):
@@ -2872,6 +3056,8 @@ class FullscreenImageViewer(QWidget):
         self._mini_arrow.move(self.width() - self._mini_arrow.width() - 10, 10)
         # Reposition navigation arrows
         self._position_nav_buttons()
+        # Keep loading indicator centered
+        self._center_loading_indicator()
         # if menu is open, keep it flush with right edge
         if self._mini_open:
             self._mini_menu.move(self.width() - self._mini_menu.width(), 0)
@@ -3127,6 +3313,11 @@ class MediaExplorer(QWidget):
         self.thumb_cache_dir = Path(self.app_dir) / ".thumbs_cache"
         self.thumb_cache_dir.mkdir(exist_ok=True)
         # persistent map (path → cache filename)
+        
+        # Video metadata cache for faster loading
+        self.video_metadata_cache = {}  # path → {duration, size, codec, etc}
+        self.video_cache_file = os.path.join(self.app_dir, "video_cache.json")
+        self._load_video_cache()
 
         # Restore Toolbar Button (only visible when toolbar is hidden)
         self.restore_toolbar_btn = QPushButton("Show Toolbar", self)
@@ -3606,6 +3797,7 @@ class MediaExplorer(QWidget):
         self.search.setPlaceholderText("Search…")
         self.search.setClearButtonEnabled(True)
         self.search.setMinimumWidth(200)  # Minimum width instead of maximum
+        self.search.setMaximumWidth(300)  # Set maximum width to prevent overflow
         self.search.setMaximumHeight(35)
         self.search.textChanged.connect(self._filterThumbnails)
         self.search.setStyleSheet(
@@ -3657,8 +3849,6 @@ class MediaExplorer(QWidget):
             sort_btn_layout.addWidget(btn)
             self.sort_buttons[mode] = btn
 
-        tb.addWidget(sort_btn_frame)
-
         # Add sort buttons inline
         search_row.addWidget(sort_btn_frame)
         search_row.addStretch()  # This will push everything left
@@ -3697,8 +3887,11 @@ class MediaExplorer(QWidget):
         search_container = QWidget()
         search_container.setLayout(search_block)
         search_container.setStyleSheet("background-color: transparent;")
+        search_container.setMaximumWidth(400)  # Limit width to prevent toolbar overflow
+        search_container.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
 
         tb.addWidget(search_container)
+        tb.addStretch()  # Add stretch to push buttons to the right and prevent overflow
 
         # ── NEW FOLDER BUTTON ─────────────────────
         self.new_folder_btn = HoverToolButton()
@@ -3762,8 +3955,6 @@ class MediaExplorer(QWidget):
         self.exit_btn.clicked.connect(self.confirmExit)
         tb.addWidget(self.exit_btn)
 
-        main.addWidget(self.toolbar)
-
         # Create QListView to replace the flow layout
         self.listView = ClickableSmoothListView(self)
         QScroller.grabGesture(
@@ -3789,6 +3980,8 @@ class MediaExplorer(QWidget):
         self.listView.horizontalScrollBar().valueChanged.connect(
             self.update_edit_mode_buttons
         )
+
+        main.addWidget(self.toolbar)
 
         # Set layout policy and add to main layout
         self.listView.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -4148,6 +4341,42 @@ class MediaExplorer(QWidget):
                 json.dump(data, f, indent=2)
         except Exception as e:
             print("Failed to save JSON:", e)
+    
+    def _load_video_cache(self):
+        """Load video metadata cache from disk"""
+        try:
+            self.video_metadata_cache = self._load_json(self.video_cache_file)
+        except:
+            self.video_metadata_cache = {}
+    
+    def _save_video_cache(self):
+        """Save video metadata cache to disk"""
+        try:
+            self._save_json(self.video_metadata_cache, self.video_cache_file)
+        except Exception as e:
+            print(f"Failed to save video cache: {e}")
+    
+    def _get_video_metadata(self, video_path):
+        """Get cached video metadata or generate it"""
+        if video_path in self.video_metadata_cache:
+            return self.video_metadata_cache[video_path]
+        
+        # Generate metadata for new video
+        try:
+            stat = os.stat(video_path)
+            metadata = {
+                'size': stat.st_size,
+                'modified': stat.st_mtime,
+                'cached_at': time.time()
+            }
+            
+            # Store in cache
+            self.video_metadata_cache[video_path] = metadata
+            self._save_video_cache()
+            return metadata
+        except Exception as e:
+            print(f"Failed to get metadata for {video_path}: {e}")
+            return {}
 
     def _on_folder_click(self, folder):
         if not self.editMode and folder in self.folder_launch_map:
@@ -4224,15 +4453,21 @@ class MediaExplorer(QWidget):
         self._update_status_labels()
 
     def open_fullscreen(self, path):
-        files = [
-            os.path.join(self.current_dir, n)
-            for n in sorted(os.listdir(self.current_dir), key=str.lower)
-            if os.path.splitext(n)[1].lower() in self.exts
-        ]
+        # Use cached media files instead of rescanning directory
+        # This eliminates the directory scanning overhead on every video open
+        media_files = getattr(self, 'media_files', [])
+        if not media_files:
+            # Fallback to scanning if cache is empty
+            media_files = [
+                os.path.join(self.current_dir, n)
+                for n in sorted(os.listdir(self.current_dir), key=str.lower)
+                if os.path.splitext(n)[1].lower() in self.exts
+            ]
+        
         self.viewer = FullscreenImageViewer(
             media_path=path,
             pdf_path=path,
-            media_list=self._get_sorted_files(),  # ✅ must use the sorted list!
+            media_list=media_files,  # Use cached media files for faster access
             slideshowInterval=self._lastInterval if self.slideshowActive else None,
             randomize=False,
             toggle_slideshow_callback=self.toggle_slideshow_mode,
@@ -4241,6 +4476,16 @@ class MediaExplorer(QWidget):
         self.viewer.showFullScreen()
 
     def _on_viewer_closed(self, refresh=False):
+        # Ensure viewer is properly cleaned up
+        if hasattr(self, 'viewer') and self.viewer:
+            # Force stop any remaining media playback
+            if hasattr(self.viewer, 'player') and self.viewer.player:
+                self.viewer.player.stop()
+                self.viewer.player.setMedia(QMediaContent())
+            if hasattr(self.viewer, 'movie') and self.viewer.movie:
+                self.viewer.movie.stop()
+            self.viewer.deleteLater()
+        
         self.viewer = None
         if refresh:
             self.load_directory(self.current_dir)
@@ -4455,6 +4700,9 @@ class MediaExplorer(QWidget):
         self.settings["breadcrumb_visible"] = self.breadcrumb_visible
         self.settings["toolbar_visible"] = self.toolbar_visible
         self._save_json(self.settings, self.settings_file)
+        
+        # Save video metadata cache
+        self._save_video_cache()
         event.accept()
 
     def _thumb_cache_path(self, path: str) -> Path:
@@ -5223,7 +5471,7 @@ class MediaExplorer(QWidget):
             # Fallback to empty icon if something goes wrong
             return QIcon()
 
-    def _set_folder_thumbnail(self, pixmap: QPixmap):
+    def _set_folder_thumbnail(self, folder: str, pixmap: QPixmap):
         thumb_path = os.path.join(
             self.thumb_cache_dir,
             f"folder_{hashlib.md5(pixmap.toImage().bits()).hexdigest()}.png",
@@ -6038,4 +6286,3 @@ if __name__ == "__main__":
     splash.finish(window)
 
     sys.exit(app.exec_())
-
