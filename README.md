@@ -11,7 +11,7 @@ simple, fast, and intuitive interface.
 a) K-Lite Codec Pack is required to view video files in the program. You can
    download this here: https://codecguide.com/download_kl.htm
    
-b) if launching the program from the .py file, ensure "opencv_world480.dll" is in the same directory as .py file (OpenCV 4.8 (or compatible).)
+b) if launching the program from the .py file, ensure "opencv_world480.dll" is saved in the "_internal" folder (OpenCV 4.8 (or compatible).)
 
 ------------------------------------------------------------
 2. Installation
