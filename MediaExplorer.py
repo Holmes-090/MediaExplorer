@@ -1029,10 +1029,9 @@ class FullscreenImageViewer(QWidget):
         self.page_index = 0
 
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setFocus()
         self.setCursor(Qt.ArrowCursor)
 
-        # Main layout
+        # ─── Main layout ───
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
@@ -1043,11 +1042,6 @@ class FullscreenImageViewer(QWidget):
         self.media_layout.setSpacing(0)
         outer_layout.addWidget(self.media_container)
 
-        self.hide_timer = QTimer(self)
-        self.hide_timer.setInterval(3000)
-        self.hide_timer.timeout.connect(self._hide_controls)
-        QShortcut(QKeySequence("Ctrl+P"), self, activated=self._print_current)
-        
         # Video preloading system for faster playback
         self.preload_players = {}  # Cache preloaded video players
         self.max_preload = 2  # Preload next 2 videos
@@ -1187,30 +1181,43 @@ class FullscreenImageViewer(QWidget):
         self._print_btn.clicked.connect(self._print_current)
         self._mini_menu_layout.addWidget(self._print_btn)
 
-        # Volume slider (placed after menu setup)
+        # ─── Persistent Video Player ───
+        self.player = QMediaPlayer(self)
+        self.video_widget = QVideoWidget()
+        self.player.setVideoOutput(self.video_widget)
+
+        self.video_container = QWidget(self)
+        vbox = QVBoxLayout(self.video_container)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+        vbox.addWidget(self.video_widget)
+
+        # Video controls
+        ctrl = QHBoxLayout()
+        self.play_btn = QPushButton()
+        self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+        self.play_btn.clicked.connect(self._toggle_play)
+
+        self.slider = ClickableSlider(Qt.Horizontal)
+        self.slider.setRange(0, 0)
+        self.slider.sliderMoved.connect(self.player.setPosition)
+
+        self.mute_btn = QPushButton()
+        self.mute_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
+        self.mute_btn.setCheckable(True)
+        self.mute_btn.clicked.connect(self._toggle_mute)
+
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(50)
-        self.volume_slider.setFixedWidth(120)
-        self.volume_slider.setStyleSheet(
-            """
-            QSlider::groove:horizontal {
-                background: #444;
-                height: 6px;
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: white;
-                border: 1px solid #999;
-                width: 12px;
-                margin: -5px 0;
-                border-radius: 6px;
-            }
-        """
-        )
+        self.volume_slider.setFixedWidth(100) 
         self.volume_slider.valueChanged.connect(self._set_volume)
-        self.volume_slider.hide()
-        self._mini_menu_layout.addWidget(self.volume_slider)
+
+        ctrl.addWidget(self.play_btn)
+        ctrl.addWidget(self.slider)
+        ctrl.addWidget(self.mute_btn)
+        ctrl.addWidget(self.volume_slider)
+        vbox.addLayout(ctrl)
 
         # ─── Left/Right Navigation Buttons ───
         self.left_nav_btn = QToolButton(self)
@@ -1293,10 +1300,22 @@ class FullscreenImageViewer(QWidget):
         # Now load the selected media
         self.load_media(media_path)
 
+        # Keep hidden until a video is loaded
+        self.video_container.hide()
+        self.media_layout.addWidget(self.video_container)
+
+        # Connect player events
+        self.player.positionChanged.connect(self.slider.setValue)
+        self.player.durationChanged.connect(self.slider.setMaximum)
+
+        # Load initial media
+        self.load_media(media_path)
+
     def load_media(self, path):
-        # stop previous
-        if hasattr(self, "player"):
-            self.player.stop()
+        """Load images, GIFs, PDFs, or videos into the viewer."""
+
+        # Stop any running playback
+        self.player.stop()
         if hasattr(self, "movie"):
             self.movie.stop()
         if hasattr(self, "pdf_widget"):
@@ -1304,25 +1323,19 @@ class FullscreenImageViewer(QWidget):
         if self.slideshowTimer:
             self.slideshowTimer.stop()
 
-        # 🔍 Properly remove lingering PDF page label
-        if hasattr(self, "_page_label"):
-            self._page_label.hide()
-            self._page_label.setParent(None)
-            del self._page_label
-
-        # clear layout
-        while self.media_layout.count():
-            w = self.media_layout.takeAt(0).widget()
+        # Hide all existing widgets first
+        for i in range(self.media_layout.count()):
+            w = self.media_layout.itemAt(i).widget()
             if w:
-                w.setParent(None)
+                w.hide()
 
         ext = os.path.splitext(path)[1].lower()
         self.setWindowTitle(os.path.basename(path))
-        self.path = path  # update current path
+        self.path = path
         self._update_file_label()
 
         if ext == ".gif":
-            # GIF
+            # GIFs
             self.movie = QMovie(path)
             self.movie.setCacheMode(QMovie.CacheAll)
             self.view = ZoomableGraphicsView(self)
@@ -1332,146 +1345,31 @@ class FullscreenImageViewer(QWidget):
             self.view.setScene(scene)
             self.view.setBackgroundBrush(Qt.black)
             self.media_layout.addWidget(self.view)
+            self.view.show()
 
             self.movie.frameChanged.connect(self._update_gif_frame)
             self.movie.start()
 
         elif ext in (".mp4", ".avi", ".mov", ".webm"):
-            self.video_widget = QVideoWidget()
-            self.video_widget.setMouseTracking(True)
-            self.video_widget.installEventFilter(self)
-            self.video_widget.setStyleSheet("background-color: black;")
-
-            # Check if we have a preloaded player for this video
-            if path in self.preload_players:
-                self.player = self.preload_players.pop(path)
-                print(f"Using preloaded player for {os.path.basename(path)}")
-            else:
-                self.player = QMediaPlayer(self)
-                # Advanced optimization for faster loading
-                self.player.setNotifyInterval(100)  # Reduce notification overhead
-                
-                # Set initial volume to prevent audio glitches
-                self.player.setVolume(50)
-                
-                # Load media with optimized URL handling
-                media_url = QUrl.fromLocalFile(path)
-                media_content = QMediaContent(media_url)
-                self.player.setMedia(media_content)
-                
-                # Attempt to seek to position 0 to trigger faster initial frame loading
-                QTimer.singleShot(50, lambda: self._trigger_initial_frame_load())
-            
-            self.player.setVideoOutput(self.video_widget)
-            self.media_layout.addWidget(self.video_widget)
-            
-            # Show loading indicator
-            self._show_video_loading_indicator()
-            
-            # Connect status signals for better loading feedback
-            self.player.mediaStatusChanged.connect(self._on_video_status_changed)
-            self.player.positionChanged.connect(self._on_video_position_changed)
-            self.player.error.connect(self._on_video_error)
-            
-            # Start playback
+            # Videos
+            self.video_container.show()
+            media_url = QUrl.fromLocalFile(path)
+            self.player.setMedia(QMediaContent(media_url))
             self.player.play()
-            
-            # Preload next videos for faster navigation
-            self._preload_adjacent_videos()
-
-            ctrl = QHBoxLayout()
-            ctrl.setContentsMargins(10, 10, 10, 10)
-            ctrl.setSpacing(10)
-
-            # ── Left Navigation Button for Video ──
-            # Hide the image/PDF navigation buttons if they exist
-            if hasattr(self, "left_nav_btn"):
-                self.left_nav_btn.hide()
-            if hasattr(self, "right_nav_btn"):
-                self.right_nav_btn.hide()
-            self.video_prev_btn = QToolButton()
-            self.video_prev_btn.setIcon(QIcon("_internal/icons/navigate_left.svg"))
-            self.video_prev_btn.setIconSize(QSize(32, 32))
-            self.video_prev_btn.setCursor(Qt.PointingHandCursor)
-            self.video_prev_btn.setStyleSheet(
-                """
-                QToolButton {
-                    background-color: transparent;
-                    border: none;
-                }
-                QToolButton:hover {
-                    background-color: rgba(255, 255, 255, 40);
-                    border-radius: 6px;
-                }
-            """
-            )
-            self.video_prev_btn.clicked.connect(self._prev)
-            ctrl.addWidget(self.video_prev_btn)
-
-            # Play/Pause
-            self.play_btn = QPushButton()
-            self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
-            self.play_btn.clicked.connect(self._toggle_play)
-            ctrl.addWidget(self.play_btn)
-
-            # Seek Bar
-            self.slider = ClickableSlider(Qt.Horizontal)
-            self.slider.setRange(0, 0)
-            self.slider.sliderMoved.connect(self.player.setPosition)
-            ctrl.addWidget(self.slider)
-
-            # Mute
-            self.mute_btn = QPushButton()
-            self.mute_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
-            self.mute_btn.setCheckable(True)
-            self.mute_btn.clicked.connect(self._toggle_mute)
-            ctrl.addWidget(self.mute_btn)
-
-            # Volume
-            self.volume_slider = QSlider(Qt.Horizontal)
-            self.volume_slider.setRange(0, 100)
-            self.volume_slider.setValue(50)
-            self.volume_slider.setFixedWidth(100)
-            self.volume_slider.valueChanged.connect(self._set_volume)
-            ctrl.addWidget(self.volume_slider)
-
-            # ── Right Navigation Button for Video ──
-            self.video_next_btn = QToolButton()
-            self.video_next_btn.setIcon(QIcon("_internal/icons/navigate_right.svg"))
-            self.video_next_btn.setIconSize(QSize(32, 32))
-            self.video_next_btn.setCursor(Qt.PointingHandCursor)
-            self.video_next_btn.setStyleSheet(
-                """
-                QToolButton {
-                    background-color: transparent;
-                    border: none;
-                }
-                QToolButton:hover {
-                    background-color: rgba(255, 255, 255, 40);
-                    border-radius: 6px;
-                }
-            """
-            )
-            self.video_next_btn.clicked.connect(lambda: self._advance(1))
-            ctrl.addWidget(self.video_next_btn)
-
-            self.media_layout.addLayout(ctrl)
-            self.player.positionChanged.connect(self.slider.setValue)
-            self.player.durationChanged.connect(self.slider.setMaximum)
-            self.hide_timer.start()
+            self.slider.setValue(0)
 
         elif ext == ".pdf":
             try:
                 self._load_pdf(path)
-                self.volume_slider.hide()
+                self.pdf_widget.show()
             except Exception as e:
                 err = QLabel(f"Unable to display PDF:\n{e}")
                 err.setStyleSheet("color: white; padding: 12px;")
                 self.media_layout.addWidget(err)
-                self.volume_slider.hide()
+                err.show()
 
         else:
-            # Image
+            # Static images
             self.view = ZoomableGraphicsView(self)
             scene = QGraphicsScene(self.view)
             pix = QPixmap(path)
@@ -1480,7 +1378,7 @@ class FullscreenImageViewer(QWidget):
             self.view.setScene(scene)
             self.view.setBackgroundBrush(Qt.black)
             self.media_layout.addWidget(self.view)
-            self.volume_slider.hide()
+            self.view.show()
             QTimer.singleShot(
                 0, lambda: self.view.fitInView(self.item, Qt.KeepAspectRatio)
             )
