@@ -35,7 +35,7 @@ MediaExplorer folder to a different location.
 - Right-click or press Escape to go back.
 - You cannot go above the root folder.
 
-To go higher in your file path, move the MediaExplorer folder higher.
+You cannot go above the root folder (location of MediaExplorer installation folder). To go higher in your file path, move the MediaExplorer folder higher.
 
 ------------------------------------------------------------
 4. Fullscreen Viewer
