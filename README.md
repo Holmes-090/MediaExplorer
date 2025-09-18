@@ -1,4 +1,4 @@
-MediaExplorer - Version 1.0 (2025)
+MediaExplorer - Version 1.3 (2025)
 
 MediaExplorer is a lightweight desktop app for browsing and managing media files. 
 It supports images, videos, GIFs, PDFs, and more. Easily navigate folders, open 
