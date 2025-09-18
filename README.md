@@ -8,10 +8,7 @@ simple, fast, and intuitive interface.
 ------------------------------------------------------------
 1. Dependencies
 ------------------------------------------------------------
-a) K-Lite Codec Pack is required to view video files in the program. You can
-   download this here: https://codecguide.com/download_kl.htm
-   
-b) if launching the program from the .py file, ensure "opencv_world480.dll" is saved in the "_internal" folder (OpenCV 4.8 (or compatible).)
+if launching the program from the .py file, ensure "opencv_world480.dll" is saved in the "_internal" folder (OpenCV 4.8 (or compatible).)
 
 ------------------------------------------------------------
 2. Installation
@@ -101,7 +98,8 @@ A: Initial load may be slow. Thumbnails are cached for faster access next time.
 
 Q: The program crashes while loading.
 
-A: Wait for the spinner to stop before clicking. Heavy interaction during loading may cause instability.
+A: Wait for the spinner to stop before clicking. Heavy interaction during loading may cause instability. Reduce the size of your folder or split large folders
+if crashing persists. Video files may take up to 30 seconds to load in very large folders.
 
 Q: Some thumbnails didn't load.
 
