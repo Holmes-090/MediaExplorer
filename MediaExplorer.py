@@ -9,6 +9,7 @@ import fitz
 import shutil
 import time
 import gc
+import vlc
 import mediathumbgen
 from pathlib import Path
 from queue import Queue, Empty
@@ -84,6 +85,7 @@ from PyQt5.QtGui import (
     QPen,
     QGuiApplication,
     QFontMetrics,
+    QCursor,
 )
 from PyQt5.QtCore import (
     Qt,
@@ -825,6 +827,7 @@ class ZoomableGraphicsView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setMouseTracking(True)
 
     def wheelEvent(self, e):
         f = 1.1 if e.angleDelta().y() > 0 else 0.9
@@ -1023,15 +1026,38 @@ class FullscreenImageViewer(QWidget):
         self._close_callback = close_callback
         self.media_list = media_list
         self.randomize = randomize
-        self.idx = media_list.index(media_path)
         self.interval = slideshowInterval
         self.slideshowTimer = None
         self.page_index = 0
+        self._is_closing = False
+        self._vlc_cleanup_done = False
+        
+        # Navigation control to prevent freezing
+        self._navigating = False
+        self._navigation_pending = None
+        self._navigation_timer = QTimer()
+        self._navigation_timer.setSingleShot(True)
+        self._navigation_timer.timeout.connect(self._process_pending_navigation)
+        
+        # Track if video is supposed to be looping
+        self._should_loop = True
+        self._loop_timer = QTimer()
+        self._loop_timer.setSingleShot(True)
+        self._loop_timer.timeout.connect(self._check_and_restart_video)
 
+        # Set fullscreen window flags
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_DeleteOnClose)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setCursor(Qt.ArrowCursor)
+        self.setStyleSheet("background-color: black;")
 
-        # ─── Main layout ───
+        try:
+            self.idx = media_list.index(media_path)
+        except ValueError:
+            self.idx = 0
+        
+        # Main layout
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
@@ -1042,21 +1068,54 @@ class FullscreenImageViewer(QWidget):
         self.media_layout.setSpacing(0)
         outer_layout.addWidget(self.media_container)
 
-        # Video preloading system for faster playback
-        self.preload_players = {}  # Cache preloaded video players
-        self.max_preload = 2  # Preload next 2 videos
+        # Mini-menu setup
+        self._setup_mini_menu()
 
-        try:
-            self.idx = media_list.index(media_path)
-        except ValueError:
-            self.idx = 0  # fallback if not found
+        # Create VLC instance with optimized settings
+        vlc_args = [
+            '--intf', 'dummy',
+            '--no-video-title-show',
+            '--file-caching=1000',  # Increased for stability
+            '--network-caching=1000',
+            '--no-audio-time-stretch',
+            '--avcodec-fast',
+            '--no-spu',
+            '--quiet',
+            '--no-disable-screensaver',
+            '--no-snapshot-preview',
+        ]
+        
+        self.instance = vlc.Instance(vlc_args)
+        self.vlc_player = self.instance.media_player_new()
 
+        # Video Container with Controls
+        self._setup_video_controls()
+
+        # Navigation buttons
+        self._setup_navigation()
+
+        # Timers
+        self._setup_timers()
+
+        # Event handling
+        self._setup_event_handling()
+
+        # Load initial media
+        self.load_media(media_path)
+
+        # Position elements after a short delay
+        QTimer.singleShot(100, self._position_elements)
+
+        self.setMouseTracking(True)
+        self.media_container.setMouseTracking(True)
+
+    def _setup_mini_menu(self):
+        """Setup mini menu components"""
         # Mini-menu arrow
         self._mini_arrow = QToolButton(self)
         self._mini_arrow.setArrowType(Qt.LeftArrow)
-        self._mini_arrow.setStyleSheet("background: rgba(30,30,30,220);")
+        self._mini_arrow.setStyleSheet("background: rgba(30,30,30,220); border: none; border-radius: 4px;")
         self._mini_arrow.setFixedSize(40, 40)
-        self._mini_arrow.move(self.width() - 30 - 10, 10)
 
         # Mini-menu container
         self._mini_menu = QFrame(self)
@@ -1066,17 +1125,16 @@ class FullscreenImageViewer(QWidget):
         self._mini_menu.setStyleSheet(
             """
             QFrame {
-                background-color: rgba(30, 30, 30, 100);
+                background-color: rgba(30, 30, 30, 200);
                 border-radius: 12px;
-                border: 1px solid rgba(255,255,255,0.08);
+                border: 1px solid rgba(255,255,255,0.15);
             }
         """
         )
         self._mini_menu.setFixedSize(150, 200)
-        self._mini_menu.move(self.width(), 50)
-        self._mini_menu.move(self.width(), 50)  # start offscreen
-        self._mini_menu.hide()  # keep hidden at launch
+        self._mini_menu.hide()
 
+        # Shadow effect for mini menu
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(20)
         shadow.setXOffset(0)
@@ -1091,10 +1149,8 @@ class FullscreenImageViewer(QWidget):
         self._mini_open = False
 
         self._mini_arrow.clicked.connect(self._toggle_mini_menu)
-        self._mini_arrow.raise_()
-        self._mini_menu.raise_()
 
-        # File label at top
+        # File label
         self._file_label = QLabel(os.path.basename(self.path), self._mini_menu)
         self._file_label.setAlignment(Qt.AlignCenter)
         self._file_label.setWordWrap(True)
@@ -1103,225 +1159,272 @@ class FullscreenImageViewer(QWidget):
             QLabel {
                 color: white;
                 font-weight: bold;
-                font-size: 7pt;
+                font-size: 8pt;
                 padding: 2px;
             }
         """
         )
         self._mini_menu_layout.insertWidget(0, self._file_label)
 
+        # Add buttons to mini menu
+        self._setup_mini_menu_buttons()
+
+    def _setup_mini_menu_buttons(self):
+        """Setup mini menu buttons"""
         # Slideshow button
         self._slideshow_btn = QToolButton(self._mini_menu)
-        self._slideshow_btn.setText("Slideshow Mode")
-        self._slideshow_btn.setIcon(QIcon("_internal/icons/slideshow.svg"))
-        self._slideshow_btn.setIconSize(QSize(24, 24))
-        self._slideshow_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._slideshow_btn.setStyleSheet(
-            """
-            QToolButton {
-                color: #e0e0e0;
-                background-color: #2a2a2a;
-                border: 1px solid #555;
-                border-radius: 4px;
-                padding: 4px;
-                font-weight: bold;
-            }
-            QToolButton:hover { background-color: #3a3a3a; }
-            QToolButton:pressed { background-color: #333333; }
-        """
-        )
+        self._slideshow_btn.setText("Slideshow")
+        self._slideshow_btn.setStyleSheet(self._get_button_style())
         self._slideshow_btn.clicked.connect(self.start_stop_slideshow)
         self._mini_menu_layout.addWidget(self._slideshow_btn)
 
         # Random button
         self.rand_btn = QToolButton(self._mini_menu)
         self.rand_btn.setText("Random")
-        self.rand_btn.setIcon(QIcon("_internal/icons/random.svg"))
-        self.rand_btn.setIconSize(QSize(24, 24))
-        self.rand_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.rand_btn.setCheckable(True)
-        self.rand_btn.setStyleSheet(
-            """
-            QToolButton {
-                color: #e0e0e0;
-                background-color: #2a2a2a;
-                border: 1px solid #555;
-                border-radius: 4px;
-                padding: 4px;
-                font-weight: bold;
-            }
-            QToolButton:checked { background-color: #444444; }
-            QToolButton:hover { background-color: #3a3a3a; }
-            QToolButton:pressed { background-color: #333333; }
-        """
-        )
+        self.rand_btn.setChecked(self.randomize)
+        self.rand_btn.setStyleSheet(self._get_button_style())
         self.rand_btn.toggled.connect(self._toggle_random_mode)
         self._mini_menu_layout.addWidget(self.rand_btn)
 
         # Print button
         self._print_btn = QToolButton(self._mini_menu)
         self._print_btn.setText("Print")
-        self._print_btn.setIcon(QIcon("_internal/icons/print.svg"))
-        self._print_btn.setIconSize(QPixmap(34, 34).size())
-        self._print_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._print_btn.setStyleSheet(
-            """
-            QToolButton {
-                color: #e0e0e0;
-                background-color: #2a2a2a;
-                border: 1px solid #555;
-                border-radius: 4px;
-                padding: 4px;
-                font-weight: bold;
-            }
-            QToolButton:hover { background-color: #3a3a3a; }
-            QToolButton:pressed { background-color: #333333; }
-        """
-        )
+        self._print_btn.setStyleSheet(self._get_button_style())
         self._print_btn.clicked.connect(self._print_current)
         self._mini_menu_layout.addWidget(self._print_btn)
-
-        # ─── Persistent Video Player ───
-        self.player = QMediaPlayer(self)
-        self.video_widget = QVideoWidget()
-        self.player.setVideoOutput(self.video_widget)
-
-        self.video_container = QWidget(self)
-        vbox = QVBoxLayout(self.video_container)
-        vbox.setContentsMargins(0, 0, 0, 0)
-        vbox.setSpacing(0)
-        vbox.addWidget(self.video_widget)
-
-        # Video controls
-        ctrl = QHBoxLayout()
-        self.play_btn = QPushButton()
-        self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
-        self.play_btn.clicked.connect(self._toggle_play)
-
-        self.slider = ClickableSlider(Qt.Horizontal)
-        self.slider.setRange(0, 0)
-        self.slider.sliderMoved.connect(self.player.setPosition)
-
-        self.mute_btn = QPushButton()
-        self.mute_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
-        self.mute_btn.setCheckable(True)
-        self.mute_btn.clicked.connect(self._toggle_mute)
-
-        self.volume_slider = QSlider(Qt.Horizontal)
-        self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(50)
-        self.volume_slider.setFixedWidth(100) 
-        self.volume_slider.valueChanged.connect(self._set_volume)
-
-        ctrl.addWidget(self.play_btn)
-        ctrl.addWidget(self.slider)
-        ctrl.addWidget(self.mute_btn)
-        ctrl.addWidget(self.volume_slider)
-        vbox.addLayout(ctrl)
-
-        # ─── Left/Right Navigation Buttons ───
-        self.left_nav_btn = QToolButton(self)
-        self.left_nav_btn.setIcon(QIcon("_internal/icons/navigate_left.svg"))
-        self.left_nav_btn.setIconSize(QSize(48, 48))
-        self.left_nav_btn.setCursor(Qt.PointingHandCursor)
-        self.left_nav_btn.clicked.connect(self._prev)
-        self.left_nav_btn.setStyleSheet(
-            """
-            QToolButton {
-                background-color: transparent;
-                border: none;
-                padding: 0px;
-            }
-            QToolButton:hover {
-                background-color: rgba(255, 255, 255, 30);
-                border-radius: 6px;
-                padding: 4px;
-            }
-        """
-        )
-
-        self.right_nav_btn = QToolButton(self)
-        self.right_nav_btn.setIcon(QIcon("_internal/icons/navigate_right.svg"))
-        self.right_nav_btn.setIconSize(QSize(48, 48))
-        self.right_nav_btn.setCursor(Qt.PointingHandCursor)
-        self.right_nav_btn.clicked.connect(lambda: self._advance(1))
-        self.right_nav_btn.setStyleSheet(
-            """
-            QToolButton {
-                background-color: transparent;
-                border: none;
-                padding: 0px;
-            }
-            QToolButton:hover {
-                background-color: rgba(255, 255, 255, 30);
-                border-radius: 6px;
-                padding: 4px;
-            }
-        """
-        )
-
-        for btn in [self.left_nav_btn, self.right_nav_btn]:
-            btn.setAttribute(Qt.WA_TranslucentBackground)
-            btn.setAttribute(Qt.WA_NoSystemBackground)
-            btn.setAutoFillBackground(False)
-            btn.setStyleSheet(
-                """
-                QToolButton {
-                    background-color: transparent;
-                    border: none;
-                    padding: 0px;
-                }
-                QToolButton:hover {
-                    background-color: rgba(0, 0, 0, 60);  /* darker for video */
-                    border-radius: 6px;
-                    padding: 4px;
-                }
-            """
-            )
-
-        self.left_nav_btn.raise_()
-        self.right_nav_btn.raise_()
-
-        # Position them with a timer after window has geometry
-        QTimer.singleShot(0, self._position_nav_buttons)
 
         # Delete File button (only for static images)
         ext = os.path.splitext(self.path)[1].lower()
         if ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
             delete_file_btn = QPushButton("Delete File")
             delete_file_btn.setStyleSheet(
-                "color: white; background-color: #702020; border-radius: 4px; padding: 6px;"
+                """
+                QPushButton {
+                    color: white; 
+                    background-color: #d32f2f; 
+                    border: none;
+                    border-radius: 4px; 
+                    padding: 6px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #f44336;
+                }
+                """
             )
             delete_file_btn.clicked.connect(self._confirm_delete_file)
             self._mini_menu_layout.addWidget(delete_file_btn)
 
         self._mini_menu_layout.addStretch()
 
-        # Now load the selected media
-        self.load_media(media_path)
+    def _setup_video_controls(self):
+        """Setup video container and controls"""
+        self.video_container = QWidget(self)
+        video_layout = QVBoxLayout(self.video_container)
+        video_layout.setContentsMargins(0, 0, 0, 0)
+        video_layout.setSpacing(0)
 
-        # Keep hidden until a video is loaded
-        self.video_container.hide()
+        # Video display widget
+        self.video_display = QWidget(self.video_container)
+        self.video_display.setStyleSheet("background-color: black;")
+        self.video_container.setMouseTracking(True)
+        self.video_display.setMouseTracking(True)
+        video_layout.addWidget(self.video_display, 1)
+
+        # Set VLC window
+        if sys.platform.startswith("linux"):
+            self.vlc_player.set_xwindow(self.video_display.winId())
+        elif sys.platform == "win32":
+            self.vlc_player.set_hwnd(self.video_display.winId())
+        elif sys.platform == "darwin":
+            self.vlc_player.set_nsobject(int(self.video_display.winId()))
+
+        # Video controls
+        self.video_controls = QWidget(self.video_container)
+        self.video_controls.setStyleSheet(
+            """
+            QWidget {
+                background-color: rgba(0, 0, 0, 200);
+                border-radius: 8px;
+            }
+            QPushButton {
+                background-color: rgba(255, 255, 255, 30);
+                border: 1px solid rgba(255, 255, 255, 50);
+                border-radius: 6px;
+                color: white;
+                padding: 8px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 50);
+            }
+            QPushButton:pressed {
+                background-color: rgba(255, 255, 255, 20);
+            }
+        """
+        )
+        self.video_controls.setFixedHeight(70)
+
+        controls_layout = QHBoxLayout(self.video_controls)
+        controls_layout.setContentsMargins(15, 10, 15, 10)
+        controls_layout.setSpacing(15)
+
+        # Play/Pause button
+        self.play_btn = QPushButton()
+        self.play_btn.setIcon(self._create_white_icon(QStyle.SP_MediaPlay))
+        self.play_btn.setFixedSize(50, 50)
+        self.play_btn.clicked.connect(self._toggle_play_vlc)
+        controls_layout.addWidget(self.play_btn)
+
+        # Seek slider
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 0)
+        self.slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border: 1px solid rgba(255, 255, 255, 100);
+                height: 6px;
+                background: rgba(255, 255, 255, 50);
+                margin: 2px 0;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: white;
+                border: 2px solid rgba(0, 0, 0, 100);
+                width: 16px;
+                margin: -6px 0;
+                border-radius: 8px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #e0e0e0;
+            }
+        """)
+        self._slider_pressed = False
+        self.slider.sliderPressed.connect(self._on_slider_pressed)
+        self.slider.sliderReleased.connect(self._on_slider_released)
+        self.slider.sliderMoved.connect(self._on_slider_moved)
+        self.slider.mousePressEvent = self._slider_mouse_press
+        controls_layout.addWidget(self.slider, 1)
+
+        # Mute button
+        self.mute_btn = QPushButton()
+        self.mute_btn.setIcon(self._create_white_icon(QStyle.SP_MediaVolume))
+        self.mute_btn.setFixedSize(50, 50)
+        self.mute_btn.clicked.connect(self._toggle_mute_vlc)
+        controls_layout.addWidget(self.mute_btn)
+
+        # Volume slider
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(50)
+        self.volume_slider.setFixedWidth(100)
+        self.volume_slider.setStyleSheet(self.slider.styleSheet())
+        self.volume_slider.valueChanged.connect(self._set_volume_vlc)
+        controls_layout.addWidget(self.volume_slider)
+
+        video_layout.addWidget(self.video_controls)
         self.media_layout.addWidget(self.video_container)
+        self.video_container.hide()
 
-        # Connect player events
-        self.player.positionChanged.connect(self.slider.setValue)
-        self.player.durationChanged.connect(self.slider.setMaximum)
+    def _setup_navigation(self):
+        """Setup navigation buttons"""
+        self.left_nav_btn = QToolButton(self)
+        self.left_nav_btn.setText("◀")
+        self.left_nav_btn.setFixedSize(60, 60)
+        self.left_nav_btn.setCursor(Qt.PointingHandCursor)
+        self.left_nav_btn.clicked.connect(self._prev)
+        
+        self.right_nav_btn = QToolButton(self)
+        self.right_nav_btn.setText("▶")
+        self.right_nav_btn.setFixedSize(60, 60)
+        self.right_nav_btn.setCursor(Qt.PointingHandCursor)
+        self.right_nav_btn.clicked.connect(lambda: self._advance(1))
 
-        # Load initial media
-        self.load_media(media_path)
+        nav_style = """
+            QToolButton {
+                background-color: rgba(0, 0, 0, 150);
+                border: 2px solid rgba(255, 255, 255, 100);
+                color: white;
+                font-size: 20px;
+                font-weight: bold;
+                border-radius: 30px;
+            }
+            QToolButton:hover {
+                background-color: rgba(255, 255, 255, 100);
+                color: black;
+            }
+            QToolButton:pressed {
+                background-color: rgba(255, 255, 255, 150);
+            }
+        """
+        
+        for btn in [self.left_nav_btn, self.right_nav_btn]:
+            btn.setStyleSheet(nav_style)
+
+    def _setup_timers(self):
+        """Setup all timers"""
+        # Hide/show controls timer
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.setInterval(3000)
+        self.hide_timer.timeout.connect(self._hide_video_controls)
+
+        # Navigation controls auto-hide timer
+        self.nav_hide_timer = QTimer(self)
+        self.nav_hide_timer.setSingleShot(True)
+        self.nav_hide_timer.setInterval(3000)
+        self.nav_hide_timer.timeout.connect(self._hide_navigation_controls)
+
+        # Cursor hide timer
+        self.cursor_hide_timer = QTimer(self)
+        self.cursor_hide_timer.setSingleShot(True)
+        self.cursor_hide_timer.setInterval(3000)
+        self.cursor_hide_timer.timeout.connect(lambda: self.setCursor(Qt.BlankCursor))
+
+        # VLC position update timer
+        self._vlc_timer = QTimer(self)
+        self._vlc_timer.timeout.connect(self._update_vlc_slider)
+        self._vlc_timer.start(500)
+
+        # Cursor polling timer
+        self._last_cursor_pos = QCursor.pos()
+        self._cursor_poll = QTimer(self)
+        self._cursor_poll.setInterval(120)
+        self._cursor_poll.timeout.connect(self._poll_cursor_activity)
+        self._cursor_poll.start()
+
+    def _setup_event_handling(self):
+        """Setup event filters and VLC events"""
+        # Install event filters
+        self.video_display.installEventFilter(self)
+        self.video_container.installEventFilter(self)
+        self.installEventFilter(self)
+        if QApplication.instance() is not None:
+            QApplication.instance().installEventFilter(self)
+
+        # Setup VLC event manager (will be attached when video loads)
+        self.vlc_events = None
+
+        # Enable mouse tracking
+        try:
+            self.setAttribute(Qt.WA_Hover, True)
+            self.video_container.setMouseTracking(True)
+            self.video_display.setMouseTracking(True)
+            self.video_container.setAttribute(Qt.WA_Hover, True)
+            self.video_display.setAttribute(Qt.WA_Hover, True)
+            self.video_display.setAttribute(Qt.WA_MouseTracking, True)
+            self.video_display.setFocusPolicy(Qt.StrongFocus)
+        except Exception:
+            pass
 
     def load_media(self, path):
         """Load images, GIFs, PDFs, or videos into the viewer."""
-
-        # Stop any running playback
-        self.player.stop()
-        if hasattr(self, "movie"):
-            self.movie.stop()
-        if hasattr(self, "pdf_widget"):
-            del self.pdf_widget
-        if self.slideshowTimer:
-            self.slideshowTimer.stop()
+        # Stop any pending navigation
+        if self._navigating:
+            self._navigation_pending = path
+            return
+        
+        # Clean up current media
+        self._cleanup_current_media()
 
         # Hide all existing widgets first
         for i in range(self.media_layout.count()):
@@ -1335,551 +1438,1062 @@ class FullscreenImageViewer(QWidget):
         self._update_file_label()
 
         if ext == ".gif":
-            # GIFs
-            self.movie = QMovie(path)
-            self.movie.setCacheMode(QMovie.CacheAll)
-            self.view = ZoomableGraphicsView(self)
-            scene = QGraphicsScene(self.view)
-            self.item = QGraphicsPixmapItem(self.movie.currentPixmap())
-            scene.addItem(self.item)
-            self.view.setScene(scene)
-            self.view.setBackgroundBrush(Qt.black)
-            self.media_layout.addWidget(self.view)
-            self.view.show()
-
-            self.movie.frameChanged.connect(self._update_gif_frame)
-            self.movie.start()
-
-        elif ext in (".mp4", ".avi", ".mov", ".webm"):
-            # Videos
-            self.video_container.show()
-            media_url = QUrl.fromLocalFile(path)
-            self.player.setMedia(QMediaContent(media_url))
-            self.player.play()
-            self.slider.setValue(0)
-
+            self._load_gif(path)
+        elif ext in (".mp4", ".avi", ".mov", ".webm", ".mkv", ".flv"):
+            self._load_video(path)
         elif ext == ".pdf":
-            try:
-                self._load_pdf(path)
-                self.pdf_widget.show()
-            except Exception as e:
-                err = QLabel(f"Unable to display PDF:\n{e}")
-                err.setStyleSheet("color: white; padding: 12px;")
-                self.media_layout.addWidget(err)
-                err.show()
-
+            self._load_pdf(path)
         else:
-            # Static images
+            self._load_image(path)
+
+        # Start slideshow if interval is set
+        if self.interval:
+            self.slideshowTimer = QTimer(self)
+            self.slideshowTimer.setSingleShot(True)
+            self.slideshowTimer.timeout.connect(self._advance_slideshow)
+            self.slideshowTimer.start(self.interval)
+
+    def _cleanup_current_media(self):
+        """Properly cleanup current media before loading new one"""
+        # Stop looping
+        self._should_loop = False
+        if hasattr(self, '_loop_timer'):
+            self._loop_timer.stop()
+        
+        # Stop VLC player
+        if hasattr(self, "vlc_player") and self.vlc_player and not self._vlc_cleanup_done:
+            try:
+                # Detach events first
+                if hasattr(self, 'vlc_events') and self.vlc_events:
+                    try:
+                        self.vlc_events.event_detach(vlc.EventType.MediaPlayerEndReached)
+                    except:
+                        pass
+                    self.vlc_events = None
+                
+                # Stop playback
+                if self.vlc_player.is_playing():
+                    self.vlc_player.stop()
+                
+                # Clear media
+                self.vlc_player.set_media(None)
+                
+                # Process events
+                for _ in range(3):
+                    QApplication.processEvents()
+            except Exception as e:
+                print(f"Warning during VLC cleanup: {e}")
+
+        # Stop GIF animation
+        if hasattr(self, "movie") and self.movie:
+            try:
+                self.movie.stop()
+                self.movie = None
+            except:
+                pass
+
+        # Stop slideshow timer
+        if hasattr(self, "slideshowTimer") and self.slideshowTimer:
+            try:
+                self.slideshowTimer.stop()
+                self.slideshowTimer = None
+            except:
+                pass
+
+    def contextMenuEvent(self, event):
+        """Override default context menu on right-click to exit fullscreen"""
+        if not self._is_closing:
+            event.accept()
+            self._safe_exit()
+        else:
+            super().contextMenuEvent(event)
+
+    def _load_video(self, path):
+        """Load video with improved stability and looping"""
+        self.video_container.show()
+        self._should_loop = True
+        
+        try:
+            # Ensure clean state
+            if self.vlc_player:
+                self.vlc_player.stop()
+                QApplication.processEvents()
+            
+            # Create media with optimizations
+            media = self.instance.media_new(path)
+            
+            # Add options for better performance
+            media.add_option(":file-caching=1000")
+            media.add_option(":no-audio-time-stretch")
+            media.add_option(":avcodec-fast")
+            media.add_option(":input-repeat=65535")  # Enable VLC-level looping as backup
+            
+            # Set media
+            self.vlc_player.set_media(media)
+            self.vlc_player.audio_set_volume(self.volume_slider.value())
+            
+            # Reattach VLC events for looping
+            self._reattach_vlc_events()
+            
+            # Start playback
+            self.vlc_player.play()
+            
+            # Update UI
+            self.play_btn.setIcon(self._create_white_icon(QStyle.SP_MediaPause))
+            self.slider.setValue(0)
+            self.slider.setRange(0, 0)
+            
+            # Show controls and start timers
+            QTimer.singleShot(100, self._show_video_controls)
+            QTimer.singleShot(200, self._show_all_controls)
+            
+            # Start position update timer
+            if hasattr(self, '_vlc_timer'):
+                self._vlc_timer.start(500)
+            
+            # Start loop check timer for short videos
+            self._start_loop_checker()
+            
+        except Exception as e:
+            print(f"Error loading video: {e}")
+            error_label = QLabel(f"Error loading video:\n{str(e)}")
+            error_label.setStyleSheet("color: white; font-size: 16px; padding: 20px;")
+            error_label.setAlignment(Qt.AlignCenter)
+            self.media_layout.addWidget(error_label)
+            error_label.show()
+
+    def _start_loop_checker(self):
+        """Start a timer to periodically check if video needs restarting"""
+        if hasattr(self, '_loop_timer'):
+            self._loop_timer.stop()
+            self._loop_timer.start(100)  # Check every 100ms
+
+    def _check_and_restart_video(self):
+        """Check if video has ended and restart if needed"""
+        if not self._should_loop or self._is_closing or not self.vlc_player:
+            return
+        
+        try:
+            # Check if video has ended
+            state = self.vlc_player.get_state()
+            if state == vlc.State.Ended:
+                # Get video length to determine restart strategy
+                length = self.vlc_player.get_length()
+                
+                if length and length < 3000:  # Less than 3 seconds
+                    # Immediate restart for very short videos
+                    self.vlc_player.set_position(0.0)
+                    self.vlc_player.play()
+                else:
+                    # Normal restart
+                    self.vlc_player.set_position(0.0)
+                    QTimer.singleShot(50, lambda: self.vlc_player.play() if self._should_loop else None)
+            
+            # Continue checking if we should be looping
+            if self._should_loop and not self._is_closing:
+                self._loop_timer.start(100)
+                
+        except Exception as e:
+            print(f"Error in loop checker: {e}")
+
+    def _start_video_playback(self):
+        """Start video playback with safety checks"""
+        if not self._is_closing and hasattr(self, 'vlc_player') and self.vlc_player:
+            try:
+                self.vlc_player.play()
+                # Restart the VLC timer for seek bar updates
+                if hasattr(self, '_vlc_timer') and self._vlc_timer:
+                    self._vlc_timer.start(500)
+            except Exception as e:
+                print(f"Error starting video playback: {e}")
+
+    def _restart_vlc_timer(self):
+        """Restart VLC timer for seek bar updates"""
+        if not self._is_closing and hasattr(self, '_vlc_timer') and self._vlc_timer:
+            try:
+                self._vlc_timer.stop()
+                self._vlc_timer.start(500)
+            except Exception as e:
+                print(f"Error restarting VLC timer: {e}")
+
+    def _reattach_vlc_events(self):
+        """Reattach VLC events for video looping"""
+        if not self._is_closing and hasattr(self, 'vlc_player') and self.vlc_player:
+            try:
+                # Detach existing events first
+                if hasattr(self, 'vlc_events') and self.vlc_events:
+                    try:
+                        self.vlc_events.event_detach(vlc.EventType.MediaPlayerEndReached)
+                    except Exception:
+                        pass
+                
+                # Create new event manager and attach events
+                self.vlc_events = self.vlc_player.event_manager()
+                self.vlc_events.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_video_end)
+                print("VLC events reattached for looping")
+            except Exception as e:
+                print(f"Error reattaching VLC events: {e}")
+                self.vlc_events = None
+
+    def _load_gif(self, path):
+        """Load GIF animation"""
+        self.movie = QMovie(path)
+        self.movie.setCacheMode(QMovie.CacheAll)
+        self.view = ZoomableGraphicsView(self)
+        scene = QGraphicsScene(self.view)
+        self.item = QGraphicsPixmapItem(self.movie.currentPixmap())
+        scene.addItem(self.item)
+        self.view.setScene(scene)
+        self.view.setBackgroundBrush(Qt.black)
+        self.media_layout.addWidget(self.view)
+        self.view.show()
+
+        self.movie.frameChanged.connect(self._update_gif_frame)
+        self.movie.start()
+
+    def _load_image(self, path):
+        """Load static image"""
+        try:
             self.view = ZoomableGraphicsView(self)
             scene = QGraphicsScene(self.view)
             pix = QPixmap(path)
+            if pix.isNull():
+                raise Exception("Invalid image file")
             self.item = QGraphicsPixmapItem(pix)
             scene.addItem(self.item)
             self.view.setScene(scene)
             self.view.setBackgroundBrush(Qt.black)
             self.media_layout.addWidget(self.view)
             self.view.show()
-            QTimer.singleShot(
-                0, lambda: self.view.fitInView(self.item, Qt.KeepAspectRatio)
-            )
-
-        # slideshow?
-        if self.interval:
-            self.slideshowTimer = QTimer(self)
-            self.slideshowTimer.setSingleShot(True)
-            self.slideshowTimer.timeout.connect(self._advance_slideshow)
-            self.slideshowTimer.start(self.interval)
-            self.volume_slider.hide()
-
-    def showEvent(self, event):
-        super().showEvent(event)
-
-        # Move menu offscreen (closed position)
-        self._mini_menu.move(self.width(), 50)
-        self._mini_menu.show()  # show it (still hidden visually)
-
-        # Keep arrow in correct position
-        self._mini_arrow.move(self.width() - self._mini_arrow.width() - 10, 10)
-
-        if hasattr(self, "view") and hasattr(self, "item"):
-            self.view.fitInView(self.item, Qt.KeepAspectRatioByExpanding)
+            QTimer.singleShot(50, lambda: self.view.fitInView(self.item, Qt.KeepAspectRatio))
+        except Exception as e:
+            error_label = QLabel(f"Error loading image:\n{str(e)}")
+            error_label.setStyleSheet("color: white; font-size: 16px; padding: 20px;")
+            error_label.setAlignment(Qt.AlignCenter)
+            self.media_layout.addWidget(error_label)
+            error_label.show()
 
     def _load_pdf(self, path):
-        import fitz  # PyMuPDF
+        """Load PDF file"""
+        try:
+            import fitz
+            self.doc = fitz.open(path)
+            self.page_index = 0
 
-        self.doc = fitz.open(path)
-        self.page_index = 0
+            self.view = ZoomableGraphicsView(self)
+            self.scene = QGraphicsScene(self.view)
+            self.pix_item = QGraphicsPixmapItem()
+            self.scene.addItem(self.pix_item)
+            self.view.setScene(self.scene)
+            self.view.setBackgroundBrush(Qt.black)
 
-        self.view = ZoomableGraphicsView(self)
-        self.scene = QGraphicsScene(self.view)
-        self.pix_item = QGraphicsPixmapItem()
-        self.scene.addItem(self.pix_item)
-        self.view.setScene(self.scene)
-        self.view.setBackgroundBrush(Qt.black)
+            self.media_layout.addWidget(self.view)
+            self.view.show()
 
-        self.media_layout.addWidget(self.view)
-
-        # Page number label
-        self._page_label = QLabel(self)
-        self._page_label.setStyleSheet(
+            # Page number label
+            self._page_label = QLabel(self)
+            self._page_label.setStyleSheet(
+                """
+                QLabel {
+                    color: white;
+                    background-color: rgba(0, 0, 0, 180);
+                    padding: 8px 16px;
+                    border-radius: 8px;
+                    font-weight: bold;
+                    font-size: 14px;
+                    border: 1px solid rgba(255, 255, 255, 50);
+                }
             """
-            QLabel {
-                color: white;
-                background-color: rgba(0, 0, 0, 140);
-                padding: 6px 12px;
-                border-radius: 6px;
-                font-weight: bold;
-                font-size: 14px;
-            }
-        """
-        )
-        self._page_label.setAlignment(Qt.AlignCenter)
-        self._page_label.adjustSize()
-        self._page_label.show()
+            )
+            self._page_label.setAlignment(Qt.AlignCenter)
+            self._page_label.show()
+            self._page_label.raise_()
 
-        QTimer.singleShot(0, lambda: self.show_page(self.page_index))
+            QTimer.singleShot(50, lambda: self.show_page(self.page_index))
+        except Exception as e:
+            err = QLabel(f"Unable to display PDF:\n{e}")
+            err.setStyleSheet("color: white; padding: 12px; font-size: 14px;")
+            err.setAlignment(Qt.AlignCenter)
+            self.media_layout.addWidget(err)
+            err.show()
 
-    def _advance(self, direction=1):
-        if self.randomize:
-            # Random navigation
-            new_idx = random.randint(0, len(self.media_list) - 1)
-            while new_idx == self.idx and len(self.media_list) > 1:
-                new_idx = random.randint(0, len(self.media_list) - 1)
-            self.idx = new_idx
+    # ─── FIXED: Enhanced VLC cleanup methods ───
+    def _cleanup_vlc(self):
+        """Comprehensive VLC cleanup"""
+        if self._vlc_cleanup_done:
+            return
+            
+        try:
+            # Stop looping
+            self._should_loop = False
+            if hasattr(self, '_loop_timer'):
+                self._loop_timer.stop()
+            
+            # Disconnect VLC events
+            if hasattr(self, 'vlc_events') and self.vlc_events:
+                try:
+                    self.vlc_events.event_detach(vlc.EventType.MediaPlayerEndReached)
+                except:
+                    pass
+                self.vlc_events = None
+
+            # Stop and clean up player
+            if hasattr(self, 'vlc_player') and self.vlc_player:
+                try:
+                    if self.vlc_player.is_playing():
+                        self.vlc_player.stop()
+                    
+                    QApplication.processEvents()
+                    
+                    self.vlc_player.set_media(None)
+                    self.vlc_player.release()
+                    self.vlc_player = None
+                    
+                except Exception as e:
+                    print(f"Warning during VLC player cleanup: {e}")
+
+            # Release instance
+            if hasattr(self, 'instance') and self.instance:
+                try:
+                    self.instance.release()
+                    self.instance = None
+                except Exception as e:
+                    print(f"Warning during VLC instance cleanup: {e}")
+
+            self._vlc_cleanup_done = True
+            
+        except Exception as e:
+            print(f"Error in VLC cleanup: {e}")
+            self._vlc_cleanup_done = True
+
+
+    def _safe_exit(self):
+        """Safely exit with cleanup"""
+        if self._is_closing:
+            return
+            
+        self._is_closing = True
+        self._should_loop = False
+        
+        try:
+            # Stop all timers
+            timers_to_stop = [
+                '_vlc_timer', 'hide_timer', 'nav_hide_timer', 
+                'cursor_hide_timer', '_cursor_poll', 'slideshowTimer',
+                '_mini_anim', '_loop_timer', '_navigation_timer'
+            ]
+            
+            for timer_name in timers_to_stop:
+                timer = getattr(self, timer_name, None)
+                if timer and hasattr(timer, 'stop'):
+                    try:
+                        timer.stop()
+                    except:
+                        pass
+
+            # Clean up VLC
+            self._cleanup_vlc()
+
+            # Stop GIFs
+            if hasattr(self, "movie") and self.movie:
+                try:
+                    self.movie.stop()
+                except:
+                    pass
+
+            # Call callback
+            if hasattr(self, '_close_callback') and self._close_callback:
+                try:
+                    self._close_callback()
+                except:
+                    pass
+
+            # Close window
+            self.hide()
+            self.close()
+
+        except Exception as e:
+            print(f"Error during safe exit: {e}")
+            self.close()
+
+    def _force_exit(self):
+        """Force immediate exit"""
+        self._safe_exit()  # Use the same comprehensive cleanup
+
+    def closeEvent(self, event):
+        """Handle close event"""
+        if not self._is_closing:
+            self._is_closing = True
+            
+        self._should_loop = False
+        self._cleanup_vlc()
+        
+        super().closeEvent(event)
+
+    # ─── VLC Event Handlers ───
+    def _on_video_end(self, event):
+        """Handle video end event for looping"""
+        print("Video end event triggered - attempting to loop")
+        if not self._should_loop or self._is_closing:
+            print("Video end event ignored - not looping or closing")
+            return
+        
+        try:
+            # Get video length
+            length = self.vlc_player.get_length() if self.vlc_player else 0
+            print(f"Video length: {length}ms")
+            
+            # Use appropriate restart method based on video length
+            if length and length < 3000:  # Very short video
+                print("Using immediate restart for very short video")
+                # Immediate restart
+                self.vlc_player.set_position(0.0)
+                self.vlc_player.play()
+            elif length and length < 5000:  # Short video
+                print("Using immediate restart for short video")
+                self._restart_video_immediate()
+            else:
+                print("Using delayed restart for longer video")
+                # Small delay for stability
+                QTimer.singleShot(100, self._restart_video)
+                
+        except Exception as e:
+            print(f"Error in video end handler: {e}")
+
+    def _restart_video_ultra_fast(self):
+        """Ultra-fast restart for very short videos (2-3 seconds)"""
+        print("Attempting ultra-fast video restart")
+        if not self._is_closing and hasattr(self, 'vlc_player') and self.vlc_player:
+            try:
+                # For ultra-short videos, use the most aggressive restart possible
+                self.vlc_player.set_position(0.0)
+                # Use processEvents to ensure position is set immediately
+                QApplication.processEvents()
+                self.vlc_player.play()
+                print("Ultra-fast restart completed")
+            except Exception as e:
+                print(f"Error in ultra-fast video restart: {e}")
         else:
-            # Ordered navigation
-            self.idx = (self.idx + direction) % len(self.media_list)
+            print("Ultra-fast restart skipped - closing or no VLC player")
 
-        self.load_media(self.media_list[self.idx])
+    def _restart_video_immediate(self):
+        """Immediate restart for short videos"""
+        print("Attempting immediate video restart")
+        if not self._is_closing and hasattr(self, 'vlc_player') and self.vlc_player:
+            try:
+                self.vlc_player.set_position(0.0)
+                self.vlc_player.play()
+                print("Immediate restart completed")
+            except Exception as e:
+                print(f"Error in immediate video restart: {e}")
+        else:
+            print("Immediate restart skipped - closing or no VLC player")
+
+    def _restart_video(self):
+        """Restart video playback"""
+        print("Attempting delayed video restart")
+        if not self._should_loop or self._is_closing or not self.vlc_player:
+            print("Delayed restart skipped - not looping, closing, or no VLC player")
+            return
+        
+        try:
+            self.vlc_player.set_position(0.0)
+            self.vlc_player.play()
+            print("Delayed restart completed")
+        except Exception as e:
+            print(f"Error restarting video: {e}")
+
+    # ─── VLC Control Methods ───
+    def _toggle_play_vlc(self):
+        if not self._is_closing and self.vlc_player:
+            try:
+                if self.vlc_player.is_playing():
+                    self.vlc_player.pause()
+                    self.play_btn.setIcon(self._create_white_icon(QStyle.SP_MediaPlay))
+                else:
+                    self.vlc_player.play()
+                    self.play_btn.setIcon(self._create_white_icon(QStyle.SP_MediaPause))
+            except Exception as e:
+                print(f"Error toggling play: {e}")
+
+    def _toggle_mute_vlc(self):
+        if not self._is_closing and self.vlc_player:
+            try:
+                muted = self.vlc_player.audio_get_mute()
+                self.vlc_player.audio_set_mute(not muted)
+                
+                if not muted:  # Will be muted after toggle
+                    self.mute_btn.setIcon(self._create_white_icon(QStyle.SP_MediaVolumeMuted))
+                else:  # Will be unmuted after toggle
+                    self.mute_btn.setIcon(self._create_white_icon(QStyle.SP_MediaVolume))
+            except Exception as e:
+                print(f"Error toggling mute: {e}")
+
+    def _set_volume_vlc(self, val):
+        if not self._is_closing and self.vlc_player:
+            try:
+                self.vlc_player.audio_set_volume(val)
+            except Exception as e:
+                print(f"Error setting volume: {e}")
+
+    def _update_vlc_slider(self):
+        """Update slider position - with safety checks"""
+        if (not self._is_closing and self.vlc_player and 
+            not self._slider_pressed and self.video_container.isVisible()):
+            try:
+                if self.vlc_player.is_playing():
+                    length = self.vlc_player.get_length()
+                    pos = self.vlc_player.get_time()
+                    
+                    if length > 0:
+                        if self.slider.maximum() != length:
+                            self.slider.setMaximum(length)
+                        if abs(self.slider.value() - pos) > 500:
+                            self.slider.setValue(pos)
+            except Exception:
+                pass  # Ignore VLC errors during playback
+
+    def _on_slider_pressed(self):
+        """Called when user starts dragging the slider"""
+        self._slider_pressed = True
+
+    def _on_slider_released(self):
+        """Called when user releases the slider"""
+        self._slider_pressed = False
+
+    def _on_slider_moved(self, position):
+        """Called when user moves the slider"""
+        if self._slider_pressed and not self._is_closing and self.vlc_player:
+            try:
+                self.vlc_player.set_time(position)
+            except Exception as e:
+                print(f"Error seeking: {e}")
+
+    def _slider_mouse_press(self, event):
+        """Handle mouse press on slider for click-to-seek"""
+        if event.button() == Qt.LeftButton and not self._is_closing:
+            slider_range = self.slider.maximum() - self.slider.minimum()
+            if slider_range > 0:
+                click_pos = event.x()
+                slider_width = self.slider.width()
+                
+                new_value = self.slider.minimum() + (click_pos / slider_width) * slider_range
+                new_value = max(self.slider.minimum(), min(self.slider.maximum(), int(new_value)))
+                
+                self.slider.setValue(new_value)
+                if self.vlc_player:
+                    try:
+                        self.vlc_player.set_time(new_value)
+                    except Exception as e:
+                        print(f"Error seeking on click: {e}")
+        
+        # Call the original mouse press event
+        QSlider.mousePressEvent(self.slider, event)
+
+    # ─── Controls Visibility Methods ───
+    def _hide_video_controls(self):
+        if self.video_controls and not self._is_closing:
+            self.video_controls.setVisible(False)
+
+    def _show_video_controls(self):
+        """Show video controls and restart hide timer"""
+        if (self.video_controls and self.video_container.isVisible() 
+            and not self._is_closing):
+            self.video_controls.show()
+            self.video_controls.raise_()
+            
+            if hasattr(self, 'hide_timer'):
+                self.hide_timer.stop()
+                self.hide_timer.start()
+
+    def _hide_navigation_controls(self):
+        if not self._is_closing:
+            if hasattr(self, "_mini_arrow") and not self._mini_open:
+                self._mini_arrow.setVisible(False)
+            if hasattr(self, "left_nav_btn"):
+                self.left_nav_btn.setVisible(False)
+            if hasattr(self, "right_nav_btn"):
+                self.right_nav_btn.setVisible(False)
+
+    def _show_navigation_controls(self):
+        """Show navigation controls and restart hide timer"""
+        if not self._is_closing:
+            if hasattr(self, '_mini_arrow'):
+                self._mini_arrow.show()
+            if hasattr(self, 'left_nav_btn'):
+                self.left_nav_btn.show()
+            if hasattr(self, 'right_nav_btn'):
+                self.right_nav_btn.show()
+            
+            if hasattr(self, 'nav_hide_timer'):
+                self.nav_hide_timer.stop()
+                self.nav_hide_timer.start()
+
+    def _show_all_controls(self):
+        """Show all controls and restart timers"""
+        if self._is_closing:
+            return
+            
+        try:
+            # Cursor
+            self.setCursor(Qt.ArrowCursor)
+            if hasattr(self, 'cursor_hide_timer'):
+                self.cursor_hide_timer.stop()
+                self.cursor_hide_timer.start()
+
+            # Navigation controls
+            if hasattr(self, "_mini_arrow"):
+                self._mini_arrow.setVisible(True)
+                self._mini_arrow.raise_()
+            if hasattr(self, "left_nav_btn"):
+                self.left_nav_btn.setVisible(True)
+                self.left_nav_btn.raise_()
+            if hasattr(self, "right_nav_btn"):
+                self.right_nav_btn.setVisible(True)
+                self.right_nav_btn.raise_()
+
+            # Video controls
+            if self._is_video_playing() and hasattr(self, "video_controls"):
+                self.video_controls.setVisible(True)
+                self.video_controls.raise_()
+                if hasattr(self, 'hide_timer'):
+                    self.hide_timer.stop()
+                    self.hide_timer.start()
+
+            # Restart nav hide timer
+            if hasattr(self, 'nav_hide_timer'):
+                self.nav_hide_timer.stop()
+                self.nav_hide_timer.start()
+        except Exception as e:
+            print(f"Error showing controls: {e}")
+
+    def _is_video_playing(self):
+        """Check if we're currently displaying a video"""
+        ext = os.path.splitext(self.path)[1].lower()
+        return ext in (".mp4", ".avi", ".mov", ".webm", ".mkv", ".flv") and self.video_container.isVisible()
+
+    # ─── Event Handlers ───
+    def keyPressEvent(self, event):
+        """Handle keyboard events with navigation protection"""
+        if self._is_closing:
+            return
+            
+        key = event.key()
+
+        # Handle escape key
+        if key == Qt.Key_Escape:
+            event.accept()
+            self._safe_exit()
+            return
+
+        # Show controls on any key press
+        self._show_all_controls()
+
+        if key == Qt.Key_Space and self._is_video_playing():
+            self._toggle_play_vlc()
+        elif key == Qt.Key_Right:
+            # Debounced navigation
+            if not self._navigating:
+                self._navigate_safe(1)
+        elif key == Qt.Key_Left:
+            # Debounced navigation
+            if not self._navigating:
+                self._navigate_safe(-1)
+        elif key in (Qt.Key_Down, Qt.Key_Up) and hasattr(self, "doc"):
+            # PDF page navigation
+            if key == Qt.Key_Down and self.page_index < len(self.doc) - 1:
+                self.page_index += 1
+                QTimer.singleShot(50, lambda: self.show_page(self.page_index))
+            elif key == Qt.Key_Up and self.page_index > 0:
+                self.page_index -= 1
+                QTimer.singleShot(50, lambda: self.show_page(self.page_index))
+
+        event.accept()
+
+    def _navigate_safe(self, direction):
+        """Safe navigation with debouncing"""
+        if self._navigating or self._is_closing:
+            return
+        
+        self._navigating = True
+        
+        # Stop loop checking during navigation
+        self._should_loop = False
+        if hasattr(self, '_loop_timer'):
+            self._loop_timer.stop()
+        
+        # Perform navigation
+        self._advance(direction)
+        
+        # Reset navigation flag after a delay
+        QTimer.singleShot(300, self._reset_navigation_flag)
+
+    def _reset_navigation_flag(self):
+        """Reset navigation flag and process any pending navigation"""
+        self._navigating = False
+        # Re-enable looping after navigation completes
+        self._should_loop = True
+        print("Navigation completed - looping re-enabled")
+        
+        if self._navigation_pending:
+            path = self._navigation_pending
+            self._navigation_pending = None
+            self.load_media(path)
+
+    def _process_pending_navigation(self):
+        """Process pending navigation request"""
+        if self._navigation_pending is not None:
+            self._navigating = False
+            path = self._navigation_pending
+            self._navigation_pending = None
+            self.load_media(path)
+
+    def mouseMoveEvent(self, event):
+        """Handle mouse movement"""
+        if not self._is_closing:
+            try:
+                self.setCursor(Qt.ArrowCursor)
+            except Exception:
+                pass
+            self._on_user_activity()
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        """Handle mouse clicks"""
+        if self._is_closing:
+            return
+            
+        # Right-click exits
+        if event.button() == Qt.RightButton:
+            event.accept()
+            self._safe_exit()
+            return
+            
+        # Left-click shows controls
+        if event.button() == Qt.LeftButton:
+            self._show_all_controls()
+        
+        super().mousePressEvent(event)
+
+    def eventFilter(self, obj, event):
+        """Handle events for video display and other widgets"""
+        if self._is_closing:
+            return False
+
+        # Mouse activity
+        if event.type() in (QEvent.MouseMove, QEvent.HoverMove, QEvent.Enter, QEvent.HoverEnter, QEvent.Wheel):
+            try:
+                self.setCursor(Qt.ArrowCursor)
+            except Exception:
+                pass
+            self._on_user_activity()
+            return False
+
+        # Handle mouse events on video display or container
+        if (obj is self.video_display or obj is self.video_container) and event.type() == QEvent.MouseButtonPress:
+            self._on_user_activity()
+            if event.button() == Qt.LeftButton:
+                self._toggle_play_vlc()
+                QTimer.singleShot(50, self._show_video_controls)
+                return True
+            elif event.button() == Qt.RightButton:
+                event.accept()
+                self._safe_exit()
+                return True
+                    
+        return super().eventFilter(obj, event)
+
+    def _poll_cursor_activity(self):
+        """Poll cursor position for activity"""
+        if self._is_closing:
+            return
+            
+        try:
+            pos = QCursor.pos()
+            if pos != getattr(self, '_last_cursor_pos', pos):
+                self._last_cursor_pos = pos
+                if self.isVisible() and self.isActiveWindow():
+                    self._on_user_activity()
+        except Exception:
+            pass
+
+    def _on_user_activity(self):
+        """Handle user activity"""
+        if self._is_closing:
+            return
+            
+        # Show cursor
+        try:
+            self.setCursor(Qt.ArrowCursor)
+        except Exception:
+            pass
+
+        # Show controls
+        controls = ['video_controls', 'left_nav_btn', 'right_nav_btn', '_mini_arrow']
+        for control_name in controls:
+            control = getattr(self, control_name, None)
+            if control:
+                try:
+                    control.show()
+                    control.raise_()
+                except Exception:
+                    pass
+
+        # Restart timers
+        timers = ['hide_timer', 'nav_hide_timer', 'cursor_hide_timer']
+        for timer_name in timers:
+            timer = getattr(self, timer_name, None)
+            if timer:
+                try:
+                    if timer.isActive():
+                        timer.stop()
+                    timer.start()
+                except Exception:
+                    pass
+
+    # ─── Window Events ───
+    def resizeEvent(self, event):
+        """Handle window resize"""
+        super().resizeEvent(event)
+        if not self._is_closing:
+            QTimer.singleShot(10, self._position_elements)
+
+    def showEvent(self, event):
+        """Handle window show"""
+        super().showEvent(event)
+        if not self._is_closing:
+            self.showFullScreen()
+            QTimer.singleShot(100, self._position_elements)
+            QTimer.singleShot(200, self._on_user_activity)
+            
+            if hasattr(self, "view") and hasattr(self, "item"):
+                QTimer.singleShot(150, lambda: self.view.fitInView(self.item, Qt.KeepAspectRatio))
+
+    def _position_elements(self):
+        """Position all overlay elements"""
+        if self._is_closing or self.width() <= 0 or self.height() <= 0:
+            return
+            
+        try:
+            # Position mini menu arrow
+            self._mini_arrow.move(self.width() - 50, 10)
+            
+            # Position mini menu (closed position)
+            self._mini_menu.move(self.width(), 50)
+            
+            # Position navigation buttons
+            btn_y = (self.height() - 60) // 2
+            self.left_nav_btn.move(20, btn_y)
+            self.right_nav_btn.move(self.width() - 80, btn_y)
+            
+            # Raise overlay elements
+            for element in [self._mini_arrow, self._mini_menu, self.left_nav_btn, self.right_nav_btn]:
+                element.raise_()
+        except Exception as e:
+            print(f"Error positioning elements: {e}")
+
+    # ─── Navigation Methods ───
+    def _advance(self, direction=1):
+        """Navigate to next/previous media"""
+        try:
+            if self._is_closing:
+                return
+                
+            if self.randomize:
+                new_idx = random.randint(0, len(self.media_list) - 1)
+                while new_idx == self.idx and len(self.media_list) > 1:
+                    new_idx = random.randint(0, len(self.media_list) - 1)
+                self.idx = new_idx
+            else:
+                self.idx = (self.idx + direction) % len(self.media_list)
+
+            # Validate index before loading
+            if 0 <= self.idx < len(self.media_list):
+                self.load_media(self.media_list[self.idx])
+                
+        except Exception as e:
+            print(f"Error in _advance: {e}")
+
+    def _queue_navigation(self, direction):
+        """Queue navigation request with debouncing to prevent rapid key presses"""
+        current_time = time.time() * 1000  # Convert to milliseconds
+        
+        # Debounce rapid key presses (minimum 200ms between navigations)
+        if current_time - self._last_navigation_time < 200:
+            return
+            
+        # Add to queue if not already navigating
+        if not self._navigating:
+            self._navigation_queue.append(direction)
+            self._process_navigation_queue()
+    
+    def _process_navigation_queue(self):
+        """Process the navigation queue safely"""
+        if self._is_closing or self._navigating or not self._navigation_queue:
+            return
+            
+        # Get the latest navigation request (ignore older ones)
+        direction = self._navigation_queue.pop()
+        self._navigation_queue.clear()  # Clear any remaining requests
+        
+        # Set navigation flag and process
+        self._navigating = True
+        self._last_navigation_time = time.time() * 1000
+        
+        # Use a timer to process navigation asynchronously
+        QTimer.singleShot(100, lambda: self._safe_advance(direction))
+
+    def _safe_advance(self, direction=1):
+        """Safely navigate to next/previous media with proper cleanup"""
+        try:
+            if self._is_closing:
+                return
+                
+            # Reset navigation flag
+            self._navigating = False
+            
+            # Process any pending events to prevent blocking
+            QApplication.processEvents()
+            
+            # Call the original advance method with additional safety
+            self._advance(direction)
+            
+        except Exception as e:
+            print(f"Error during safe advance: {e}")
+            # Ensure navigation flag is reset even on error
+            self._navigating = False
 
     def _prev(self):
         self._advance(-1)
 
-    def _loop_video(self, st):
-        from PyQt5.QtMultimedia import QMediaPlayer
+    def _advance_slideshow(self):
+        """Advance slideshow"""
+        if not self._is_closing:
+            self._advance(1)
+            if self.slideshowTimer and self.interval:
+                self.slideshowTimer.start(self.interval)
 
-        if st == QMediaPlayer.EndOfMedia:
-            self.player.setPosition(0)
-            self.player.play()
-    
-    def _show_video_loading_indicator(self):
-        """Show a loading indicator for video playback"""
-        if hasattr(self, 'loading_label'):
-            self.loading_label.show()
-            # Update position in case window was resized
-            self._center_loading_indicator()
-        else:
-            self.loading_label = QLabel("Loading video...", self)
-            self.loading_label.setStyleSheet("""
-                QLabel {
-                    background: rgba(0, 0, 0, 180);
-                    color: white;
-                    padding: 20px;
-                    border-radius: 10px;
-                    font-size: 16px;
-                    font-weight: bold;
-                }
-            """)
-            self.loading_label.setAlignment(Qt.AlignCenter)
-            self.loading_label.resize(200, 60)
-            self._center_loading_indicator()
-            self.loading_label.show()
-            self.loading_label.raise_()  # Ensure it's on top
-    
-    def _center_loading_indicator(self):
-        """Center the loading indicator in the window"""
-        if hasattr(self, 'loading_label'):
-            self.loading_label.move(
-                (self.width() - self.loading_label.width()) // 2,
-                (self.height() - self.loading_label.height()) // 2
-            )
-    
-    def _hide_video_loading_indicator(self):
-        """Hide the loading indicator"""
-        if hasattr(self, 'loading_label'):
-            self.loading_label.hide()
-    
-    def _on_video_status_changed(self, status):
-        """Handle video media status changes for better loading feedback"""
-        from PyQt5.QtMultimedia import QMediaPlayer
+    # ─── Utility Methods ───
+    def _get_button_style(self):
+        return """
+            QToolButton {
+                color: #e0e0e0;
+                background-color: #404040;
+                border: 1px solid #666;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-weight: bold;
+                font-size: 10pt;
+            }
+            QToolButton:hover { 
+                background-color: #505050; 
+            }
+            QToolButton:pressed { 
+                background-color: #353535; 
+            }
+            QToolButton:checked { 
+                background-color: #555555;
+                border-color: #888;
+            }
+        """
+
+    def _create_white_icon(self, standard_icon):
+        """Create a white version of a standard icon"""
+        icon = self.style().standardIcon(standard_icon)
+        pixmap = icon.pixmap(32, 32)
         
-        if status == QMediaPlayer.LoadingMedia:
-            self._show_video_loading_indicator()
-        elif status == QMediaPlayer.BufferedMedia:
-            self._hide_video_loading_indicator()
-            # Ensure playback starts smoothly
-            if hasattr(self, 'player') and self.player.state() != QMediaPlayer.PlayingState:
-                self.player.play()
-        elif status == QMediaPlayer.LoadedMedia:
-            self._hide_video_loading_indicator()
-            # Media is fully loaded, ensure first frame is visible
-            if hasattr(self, 'player'):
-                self.player.setPosition(0)
-                if self.player.state() != QMediaPlayer.PlayingState:
-                    self.player.play()
-        elif status == QMediaPlayer.EndOfMedia:
-            # Loop the video
-            self.player.setPosition(0)
-            self.player.play()
-        elif status == QMediaPlayer.InvalidMedia:
-            self._hide_video_loading_indicator()
-            print(f"Invalid media: {self.path}")
-        elif status == QMediaPlayer.StalledMedia:
-            # Show loading indicator if media stalls
-            self._show_video_loading_indicator()
-    
-    def _on_video_position_changed(self, position):
-        """Handle video position changes - first frame loaded"""
-        if position > 0:
-            self._hide_video_loading_indicator()
-    
-    def _on_video_error(self, error):
-        """Handle video playback errors"""
-        self._hide_video_loading_indicator()
-        print(f"Video error for {self.path}: {error}")
-    
-    def _preload_adjacent_videos(self):
-        """Preload next few videos for faster navigation"""
-        if not hasattr(self, 'media_list') or not self.media_list:
+        white_pixmap = QPixmap(pixmap.size())
+        white_pixmap.fill(Qt.transparent)
+        
+        painter = QPainter(white_pixmap)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.drawPixmap(0, 0, pixmap)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        painter.fillRect(white_pixmap.rect(), Qt.white)
+        painter.end()
+        
+        return QIcon(white_pixmap)
+
+    def _update_file_label(self):
+        """Update the mini-menu filename label"""
+        if hasattr(self, "_file_label"):
+            self._file_label.setText(os.path.basename(self.path))
+
+    # ─── Menu Methods ───
+    def _toggle_mini_menu(self):
+        """Toggle mini menu visibility"""
+        if self._is_closing:
             return
             
-        video_exts = (".mp4", ".avi", ".mov", ".webm", ".mkv")
-        
-        # Find next videos to preload
-        for i in range(1, self.max_preload + 1):
-            next_idx = (self.idx + i) % len(self.media_list)
-            next_path = self.media_list[next_idx]
-            
-            if (os.path.splitext(next_path)[1].lower() in video_exts and 
-                next_path not in self.preload_players):
-                self._preload_video(next_path)
-    
-    def _preload_video(self, video_path):
-        """Preload a video file for faster playback"""
-        try:
-            player = QMediaPlayer()
-            # Optimize preloaded player settings
-            player.setNotifyInterval(100)
-            player.setVolume(50)  # Set default volume
-            
-            # Use optimized media content loading
-            media_url = QUrl.fromLocalFile(video_path)
-            media_content = QMediaContent(media_url)
-            player.setMedia(media_content)
-            
-            # Connect a one-time signal to seek to position 0 when loaded
-            def on_media_loaded():
-                if player.mediaStatus() == QMediaPlayer.LoadedMedia:
-                    player.setPosition(0)  # Trigger first frame load
-                    player.mediaStatusChanged.disconnect()  # Disconnect after use
-            
-            player.mediaStatusChanged.connect(on_media_loaded)
-            
-            # Store the preloaded player
-            self.preload_players[video_path] = player
-            print(f"Preloaded video: {os.path.basename(video_path)}")
-            
-            # Limit the number of preloaded videos to prevent memory issues
-            if len(self.preload_players) > self.max_preload * 2:
-                # Remove oldest preloaded video
-                oldest_path = next(iter(self.preload_players))
-                old_player = self.preload_players.pop(oldest_path)
-                old_player.deleteLater()
-                
-        except Exception as e:
-            print(f"Failed to preload video {video_path}: {e}")
-    
-    def _cleanup_preload_players(self):
-        """Clean up preloaded players to free memory"""
-        for player in self.preload_players.values():
-            player.deleteLater()
-        self.preload_players.clear()
-    
-    def _trigger_initial_frame_load(self):
-        """Trigger initial frame loading for faster video start"""
-        if hasattr(self, 'player') and self.player.mediaStatus() == QMediaPlayer.LoadedMedia:
-            # Seek to position 0 to ensure first frame is loaded
-            self.player.setPosition(0)
-        elif hasattr(self, 'player'):
-            # Try again in a bit if media isn't loaded yet
-            QTimer.singleShot(100, self._trigger_initial_frame_load)
-
-    def _toggle_play(self):
-        if self.player.state() == QMediaPlayer.PlayingState:
-            self.player.pause()
-            self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
-        else:
-            self.player.play()
-            self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
-
-    def _hide_controls(self):
-        self._mini_menu.hide()
-        self._mini_arrow.hide()
-        self.volume_slider.hide()
-
-        if hasattr(self, "left_nav_btn"):
-            self.left_nav_btn.hide()
-        if hasattr(self, "right_nav_btn"):
-            self.right_nav_btn.hide()
-
-        # Hide video controls
-        if hasattr(self, "video_prev_btn"):
-            self.video_prev_btn.hide()
-        if hasattr(self, "video_next_btn"):
-            self.video_next_btn.hide()
-        if hasattr(self, "play_btn"):
-            self.play_btn.hide()
-        if hasattr(self, "slider"):
-            self.slider.hide()
-        if hasattr(self, "mute_btn"):
-            self.mute_btn.hide()
-        if hasattr(self, "volume_slider"):
-            self.volume_slider.hide()
-
-    def _show_controls(self):
-        self._mini_menu.show()
-        self._mini_arrow.show()
-        self.volume_slider.show()
-
-        # Show image/PDF nav buttons if they exist
-        if hasattr(self, "left_nav_btn"):
-            self.left_nav_btn.show()
-        if hasattr(self, "right_nav_btn"):
-            self.right_nav_btn.show()
-
-        # Show video nav buttons and controls if applicable
-        if hasattr(self, "video_prev_btn"):
-            self.video_prev_btn.show()
-        if hasattr(self, "video_next_btn"):
-            self.video_next_btn.show()
-        if hasattr(self, "play_btn"):
-            self.play_btn.show()
-        if hasattr(self, "slider"):
-            self.slider.show()
-        if hasattr(self, "mute_btn"):
-            self.mute_btn.show()
-        if hasattr(self, "volume_slider"):
-            self.volume_slider.show()
-
-        self.hide_timer.start()
-
-    def mouseMoveEvent(self, event):
-        self._show_controls()
-        super().mouseMoveEvent(event)
-
-    def eventFilter(self, obj, ev):
-        if obj is getattr(self, "video_widget", None) and ev.type() == QEvent.MouseMove:
-            self.setCursor(Qt.ArrowCursor)
-
-            # Show core video controls
-            if hasattr(self, "slider"):
-                self.slider.show()
-            if hasattr(self, "play_btn"):
-                self.play_btn.show()
-            if hasattr(self, "mute_btn"):
-                self.mute_btn.show()
-            if hasattr(self, "volume_slider"):
-                self.volume_slider.show()
-
-            # Show new video navigation buttons
-            if hasattr(self, "video_prev_btn"):
-                self.video_prev_btn.show()
-            if hasattr(self, "video_next_btn"):
-                self.video_next_btn.show()
-
-            # Show mini menu components
-            if hasattr(self, "_mini_menu"):
-                self._mini_menu.show()
-            if hasattr(self, "_mini_arrow"):
-                self._mini_arrow.show()
-
-            self.hide_timer.start()
-            return True  # handled
-
-        return super().eventFilter(obj, ev)
-
-    def keyPressEvent(self, e):
-        key = e.key()
-
-        if e.key() == Qt.Key_Right:
-            self._advance()
-
-        elif e.key() == Qt.Key_Left:
-            self.idx = (self.idx - 1) % len(self.media_list)
-            self.load_media(self.media_list[self.idx])
-
-        if hasattr(self, "doc"):
-            if key == Qt.Key_Down and self.page_index < len(self.doc) - 1:
-                self.page_index += 1
-                self.show_page(self.page_index)
-                return
-            elif key == Qt.Key_Up and self.page_index > 0:
-                self.page_index -= 1
-                self.show_page(self.page_index)
-                return
-
-        elif key == Qt.Key_Space:
-            # Toggle play/pause if we're currently showing a video
-            if hasattr(self, "player"):
-                # QMediaPlayer.PausedState also triggers _toggle_play()
-                if self.player.state() in (
-                    QMediaPlayer.PlayingState,
-                    QMediaPlayer.PausedState,
-                ):
-                    self._toggle_play()
-
-        elif e.key() in (Qt.Key_Escape, Qt.Key_Backspace):
-            self.close()
-        else:
-            super().keyPressEvent(e)
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.RightButton:
-            self.close()
-
-    def closeEvent(self, e):
-        # Stop all media playback
-        if hasattr(self, "player"):
-            self.player.stop()
-            self.player.setMedia(QMediaContent())  # Clear media content
-            self.player.deleteLater()  # Schedule for deletion
-        if hasattr(self, "movie"):
-            self.movie.stop()
-            self.movie.deleteLater()
-        
-        # Clean up preloaded video players
-        self._cleanup_preload_players()
-        
-        # Call close callback to notify parent
-        if hasattr(self, '_close_callback') and self._close_callback:
-            self._close_callback()
-            
-        super().closeEvent(e)
-
-    def _toggle_mini_menu(self):
         self._mini_anim.stop()
+        self._show_all_controls()
+
         if not self._mini_open:
-            # slide menu in so its right edge aligns with the window's right edge
+            self._mini_menu.show()
             target_x = self.width() - self._mini_menu.width() - 10
             self._mini_anim.setStartValue(self._mini_menu.pos())
             self._mini_anim.setEndValue(QPoint(target_x, 50))
             self._mini_arrow.setArrowType(Qt.RightArrow)
+            if hasattr(self, 'nav_hide_timer'):
+                self.nav_hide_timer.stop()
         else:
-            # slide menu back off to the right
             self._mini_anim.setStartValue(self._mini_menu.pos())
             self._mini_anim.setEndValue(QPoint(self.width(), 50))
             self._mini_arrow.setArrowType(Qt.LeftArrow)
+
+            def _after_hide():
+                if not self._is_closing:
+                    self._mini_menu.hide()
+            self._mini_anim.finished.connect(_after_hide)
+            if hasattr(self, 'nav_hide_timer'):
+                self.nav_hide_timer.start()
 
         self._mini_open = not self._mini_open
         self._mini_anim.start()
 
     def start_stop_slideshow(self):
-        # If no timer is running, ask the user for X seconds and start
+        """Start or stop slideshow"""
+        if self._is_closing:
+            return
+            
         if self.slideshowTimer is None:
-            # Parent=None ensures it shows on top
+            from PyQt5.QtWidgets import QInputDialog
             secs, ok = QInputDialog.getInt(
-                None, "Slideshow", "Seconds per slide:", 5, 1, 60
+                self, "Slideshow", "Seconds per slide:", 5, 1, 60
             )
             if not ok:
                 return
 
             self.interval = secs * 1000
-
-            # Create a single-shot QTimer (we will manually re-arm it each time)
             self.slideshowTimer = QTimer(self)
             self.slideshowTimer.setSingleShot(True)
             self.slideshowTimer.timeout.connect(self._advance_slideshow)
             self.slideshowTimer.start(self.interval)
-
-            # Change the button text to "Stop Slideshow"
             self._slideshow_btn.setText("Stop Slideshow")
-
         else:
-            # If timer already exists, stop it and clear
             self.slideshowTimer.stop()
             self.slideshowTimer = None
-            self.interval = None  # ← Prevent it from restarting on media change
-            self._slideshow_btn.setText("Slideshow Mode")
-
-    def _advance_slideshow(self):
-        # Advance to the next index
-        if self.randomize:
-            self.idx = random.randrange(len(self.media_list))
-        else:
-            self.idx = (self.idx + 1) % len(self.media_list)
-
-        # Load the next media
-        next_path = self.media_list[self.idx]
-        self.load_media(next_path)
-
-        # Re-start the timer
-        if self.slideshowTimer is not None:
-            self.slideshowTimer.start(self.interval)
-
-    def show_page(self, idx):
-        """Render PDF page idx to exactly fill the viewport (preserving aspect)."""
-        page = self.doc[idx]
-        rect = page.rect  # width/height in points
-
-        # Get current viewport size
-        vp = self.view.viewport().size()
-        vp_w, vp_h = vp.width(), vp.height()
-
-        # Compute scale factors
-        scale_x = vp_w / rect.width
-        scale_y = vp_h / rect.height
-        scale = min(scale_x, scale_y)  # Fit within both dimensions
-
-        mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-
-        image = QImage(
-            pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
-        )
-        self.pix_item.setPixmap(QPixmap.fromImage(image))
-
-        # Center label
-        self._page_label.setText(f"Page {idx + 1} of {len(self.doc)}")
-        self._page_label.adjustSize()
-        label_x = (self.width() - self._page_label.width()) // 2
-        self._page_label.move(label_x, 20)
-
-        # Fit and center (optional, won't shrink if already correct size)
-        self.view.fitInView(self.pix_item, Qt.KeepAspectRatio)
-
-    def _advance_page(self):
-        if self.page_index < len(self.doc) - 1:
-            self.page_index += 1
-        else:
-            self.page_index = 0
-        self.show_page(self.page_index)
+            self.interval = None
+            self._slideshow_btn.setText("Slideshow")
 
     def _toggle_random_mode(self, checked):
-        """
-        Called when the mini-menu "Random Mode" button is clicked.
-        We simply flip our own `self.randomize` flag, so that
-        when _advance() runs, it will pick a random index if checked.
-        """
+        """Toggle random mode"""
         self.randomize = checked
-
-        # Change button text so it reads "Exit Random Mode" when active
-        self.rand_btn.setText("Exit Random" if checked else "Random Mode")
-        # If you also want to inform the parent MediaExplorer, you could do:
-        parent = self.parent()
-        if parent and hasattr(parent, "rand_btn") and parent.rand_btn.isCheckable():
-            parent.rand_btn.setChecked(checked)  # keep the parent toolbar in sync
+        self.rand_btn.setText("Exit Random" if checked else "Random")
 
     def _print_current(self):
-        # ⬇ Add this to handle fullscreen PDFs
+        """Print current media"""
         if hasattr(self, "doc") and self.doc:
             self._print_pdf()
             return
 
-        # ⬇ Fallback: static image printing
         if not hasattr(self, "item") or self.item is None:
             print("No static image to print.")
             return
 
+        from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
+        from PyQt5.QtGui import QPainter
+        
         printer = QPrinter(QPrinter.HighResolution)
         dialog = QPrintDialog(printer, self)
         if dialog.exec_() == QPrintDialog.Accepted:
@@ -1887,24 +2501,21 @@ class FullscreenImageViewer(QWidget):
             pixmap = self.item.pixmap()
             rect = painter.viewport()
             size = pixmap.size()
-            size.scale(rect.size(), Qt.KeepAspectRatioByExpanding)
+            size.scale(rect.size(), Qt.KeepAspectRatio)
             painter.setViewport(rect.x(), rect.y(), size.width(), size.height())
             painter.setWindow(pixmap.rect())
             painter.drawPixmap(0, 0, pixmap)
             painter.end()
 
-    def _update_file_label(self):
-        """Updates the mini-menu filename label."""
-        if hasattr(self, "_file_label"):
-            self._file_label.setText(os.path.basename(self.path))
-
     def _confirm_delete_file(self):
+        """Confirm and delete current file"""
+        from PyQt5.QtWidgets import QMessageBox
+        
         file_path = self.path
         file_name = os.path.basename(file_path)
 
         reply = QMessageBox.question(
-            self,
-            "Delete File",
+            self, "Delete File",
             f'This will delete "{file_name}" from your computer.\n'
             f"This cannot be undone.\n\nAre you sure you want to delete this file?",
             QMessageBox.Yes | QMessageBox.No,
@@ -1914,548 +2525,70 @@ class FullscreenImageViewer(QWidget):
             try:
                 os.remove(file_path)
                 print(f"Deleted file: {file_path}")
+                self._safe_exit()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to delete file:\n{str(e)}")
-                return
 
-            # Close viewer
-            self.close()
-
-            # Refresh thumbnails in MediaExplorer if callback exists
-            if self._close_callback:
-                self._close_callback()  # This should call load_directory again
-
-    def _on_viewer_closed(self, refresh=False):
-        self.viewer = None
-        if refresh:
-            self.load_directory(self.current_dir)
-
-    def _set_volume(self, value):
-        if hasattr(self, "player"):
-            self.player.setVolume(value)
-            if value == 0:
-                self.mute_btn.setChecked(True)
-            else:
-                self.mute_btn.setChecked(False)
-
-    def _toggle_mute(self):
-        if hasattr(self, "player"):
-            if self.mute_btn.isChecked():
-                self.player.setMuted(True)
-                self.mute_btn.setIcon(
-                    self.style().standardIcon(QStyle.SP_MediaVolumeMuted)
-                )
-            else:
-                self.player.setMuted(False)
-                self.mute_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
-
-
-    #   #This ensures the GIF always scales correctly when revisited.
-    def _update_gif_frame(self):
-        self.item.setPixmap(self.movie.currentPixmap())
-        self.view.fitInView(self.item, Qt.KeepAspectRatio)
-
-    def start_stop_slideshow(self):
-        # If no timer is running, ask the user for X seconds and start
-        if self.slideshowTimer is None:
-            # Parent=None ensures it shows on top
-            secs, ok = QInputDialog.getInt(
-                None, "Slideshow", "Seconds per slide:", 5, 1, 60
-            )
-            if not ok:
-                return
-
-            self.interval = secs * 1000
-
-            # Create a single-shot QTimer (we will manually re-arm it each time)
-            self.slideshowTimer = QTimer(self)
-            self.slideshowTimer.setSingleShot(True)
-            self.slideshowTimer.timeout.connect(self._advance_slideshow)
-            self.slideshowTimer.start(self.interval)
-
-            # Change the button text to "Stop Slideshow"
-            self._slideshow_btn.setText("Stop Slideshow")
-
-        else:
-            # If timer already exists, stop it and clear
-            self.slideshowTimer.stop()
-            self.slideshowTimer = None
-            self.interval = None  # ← Prevent it from restarting on media change
-            self._slideshow_btn.setText("Slideshow Mode")
-
-    def _advance_slideshow(self):
-        # Advance to the next index
-        if self.randomize:
-            self.idx = random.randrange(len(self.media_list))
-        else:
-            self.idx = (self.idx + 1) % len(self.media_list)
-
-        # Load the next media
-        next_path = self.media_list[self.idx]
-        self.load_media(next_path)
-
-        # Re-start the timer
-        if self.slideshowTimer is not None:
-            self.slideshowTimer.start(self.interval)
-
+    # ─── PDF Methods ───
     def show_page(self, idx):
-        """Render PDF page idx to exactly fill the viewport (preserving aspect)."""
-        page = self.doc[idx]
-        rect = page.rect  # width/height in points
-
-        # Get current viewport size
-        vp = self.view.viewport().size()
-        vp_w, vp_h = vp.width(), vp.height()
-
-        # Compute scale factors
-        scale_x = vp_w / rect.width
-        scale_y = vp_h / rect.height
-        scale = min(scale_x, scale_y)  # Fit within both dimensions
-
-        mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-
-        image = QImage(
-            pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
-        )
-        self.pix_item.setPixmap(QPixmap.fromImage(image))
-
-        # Center label
-        self._page_label.setText(f"Page {idx + 1} of {len(self.doc)}")
-        self._page_label.adjustSize()
-        label_x = (self.width() - self._page_label.width()) // 2
-        self._page_label.move(label_x, 20)
-
-        # Fit and center (optional, won't shrink if already correct size)
-        self.view.fitInView(self.pix_item, Qt.KeepAspectRatio)
-
-    def _advance_page(self):
-        if self.page_index < len(self.doc) - 1:
-            self.page_index += 1
-        else:
-            self.page_index = 0
-        self.show_page(self.page_index)
-
-    def _toggle_random_mode(self, checked):
-        """
-        Called when the mini-menu "Random Mode" button is clicked.
-        We simply flip our own `self.randomize` flag, so that
-        when _advance() runs, it will pick a random index if checked.
-        """
-        self.randomize = checked
-
-        # Change button text so it reads "Exit Random Mode" when active
-        self.rand_btn.setText("Exit Random" if checked else "Random Mode")
-        # If you also want to inform the parent MediaExplorer, you could do:
-        parent = self.parent()
-        if parent and hasattr(parent, "rand_btn") and parent.rand_btn.isCheckable():
-            parent.rand_btn.setChecked(checked)  # keep the parent toolbar in sync
-
-    def _print_current(self):
-        # ⬇ Add this to handle fullscreen PDFs
-        if hasattr(self, "doc") and self.doc:
-            self._print_pdf()
+        """Render PDF page"""
+        if not hasattr(self, 'doc') or not self.doc or self._is_closing:
             return
+            
+        try:
+            page = self.doc[idx]
+            rect = page.rect
 
-        # ⬇ Fallback: static image printing
-        if not hasattr(self, "item") or self.item is None:
-            print("No static image to print.")
-            return
+            vp = self.view.viewport().size()
+            vp_w, vp_h = vp.width(), vp.height()
 
-        printer = QPrinter(QPrinter.HighResolution)
-        dialog = QPrintDialog(printer, self)
-        if dialog.exec_() == QPrintDialog.Accepted:
-            painter = QPainter(printer)
-            pixmap = self.item.pixmap()
-            rect = painter.viewport()
-            size = pixmap.size()
-            size.scale(rect.size(), Qt.KeepAspectRatioByExpanding)
-            painter.setViewport(rect.x(), rect.y(), size.width(), size.height())
-            painter.setWindow(pixmap.rect())
-            painter.drawPixmap(0, 0, pixmap)
-            painter.end()
-
-    def _update_file_label(self):
-        """Updates the mini-menu filename label."""
-        if hasattr(self, "_file_label"):
-            self._file_label.setText(os.path.basename(self.path))
-
-    def _confirm_delete_file(self):
-        file_path = self.path
-        file_name = os.path.basename(file_path)
-
-        reply = QMessageBox.question(
-            self,
-            "Delete File",
-            f'This will delete "{file_name}" from your computer.\n'
-            f"This cannot be undone.\n\nAre you sure you want to delete this file?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-
-        if reply == QMessageBox.Yes:
-            try:
-                os.remove(file_path)
-                print(f"Deleted file: {file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to delete file:\n{str(e)}")
+            if vp_w <= 0 or vp_h <= 0:
                 return
 
-            # Close viewer
-            self.close()
+            scale_x = vp_w / rect.width
+            scale_y = vp_h / rect.height
+            scale = min(scale_x, scale_y)
 
-            # Refresh thumbnails in MediaExplorer if callback exists
-            if self._close_callback:
-                self._close_callback()  # This should call load_directory again
+            mat = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
 
-    def _on_viewer_closed(self, refresh=False):
-        self.viewer = None
-        if refresh:
-            self.load_directory(self.current_dir)
-
-    def _set_volume(self, value):
-        if hasattr(self, "player"):
-            self.player.setVolume(value)
-            if value == 0:
-                self.mute_btn.setChecked(True)
-            else:
-                self.mute_btn.setChecked(False)
-
-    def _toggle_mute(self):
-        if hasattr(self, "player"):
-            if self.mute_btn.isChecked():
-                self.player.setMuted(True)
-                self.mute_btn.setIcon(
-                    self.style().standardIcon(QStyle.SP_MediaVolumeMuted)
-                )
-            else:
-                self.player.setMuted(False)
-                self.mute_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
-
-    #   #This ensures the GIF always scales correctly when revisited.
-    def _update_gif_frame(self):
-        self.item.setPixmap(self.movie.currentPixmap())
-        self.view.fitInView(self.item, Qt.KeepAspectRatio)
-
-    def start_stop_slideshow(self):
-        # If no timer is running, ask the user for X seconds and start
-        if self.slideshowTimer is None:
-            # Parent=None ensures it shows on top
-            secs, ok = QInputDialog.getInt(
-                None, "Slideshow", "Seconds per slide:", 5, 1, 60
+            image = QImage(
+                pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
             )
-            if not ok:
-                return
+            self.pix_item.setPixmap(QPixmap.fromImage(image))
 
-            self.interval = secs * 1000
+            self._page_label.setText(f"Page {idx + 1} of {len(self.doc)}")
+            self._page_label.adjustSize()
+            label_x = (self.width() - self._page_label.width()) // 2
+            self._page_label.move(label_x, 20)
 
-            # Create a single-shot QTimer (we will manually re-arm it each time)
-            self.slideshowTimer = QTimer(self)
-            self.slideshowTimer.setSingleShot(True)
-            self.slideshowTimer.timeout.connect(self._advance_slideshow)
-            self.slideshowTimer.start(self.interval)
-
-            # Change the button text to "Stop Slideshow"
-            self._slideshow_btn.setText("Stop Slideshow")
-
-        else:
-            # If timer already exists, stop it and clear
-            self.slideshowTimer.stop()
-            self.slideshowTimer = None
-            self.interval = None  # ← Prevent it from restarting on media change
-            self._slideshow_btn.setText("Slideshow Mode")
-
-    def _advance_slideshow(self):
-        # Advance to the next index
-        if self.randomize:
-            self.idx = random.randrange(len(self.media_list))
-        else:
-            self.idx = (self.idx + 1) % len(self.media_list)
-
-        # Load the next media
-        next_path = self.media_list[self.idx]
-        self.load_media(next_path)
-
-        # Re-start the timer
-        if self.slideshowTimer is not None:
-            self.slideshowTimer.start(self.interval)
-
-    def show_page(self, idx):
-        """Render PDF page idx to exactly fill the viewport (preserving aspect)."""
-        page = self.doc[idx]
-        rect = page.rect  # width/height in points
-
-        # Get current viewport size
-        vp = self.view.viewport().size()
-        vp_w, vp_h = vp.width(), vp.height()
-
-        # Compute scale factors
-        scale_x = vp_w / rect.width
-        scale_y = vp_h / rect.height
-        scale = min(scale_x, scale_y)  # Fit within both dimensions
-
-        mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-
-        image = QImage(
-            pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
-        )
-        self.pix_item.setPixmap(QPixmap.fromImage(image))
-
-        # Center label
-        self._page_label.setText(f"Page {idx + 1} of {len(self.doc)}")
-        self._page_label.adjustSize()
-        label_x = (self.width() - self._page_label.width()) // 2
-        self._page_label.move(label_x, 20)
-
-        # Fit and center (optional, won't shrink if already correct size)
-        self.view.fitInView(self.pix_item, Qt.KeepAspectRatio)
-
-    def _advance_page(self):
-        if self.page_index < len(self.doc) - 1:
-            self.page_index += 1
-        else:
-            self.page_index = 0
-        self.show_page(self.page_index)
-
-    def _toggle_random_mode(self, checked):
-        """
-        Called when the mini-menu "Random Mode" button is clicked.
-        We simply flip our own `self.randomize` flag, so that
-        when _advance() runs, it will pick a random index if checked.
-        """
-        self.randomize = checked
-
-        # Change button text so it reads "Exit Random Mode" when active
-        self.rand_btn.setText("Exit Random" if checked else "Random Mode")
-        # If you also want to inform the parent MediaExplorer, you could do:
-        parent = self.parent()
-        if parent and hasattr(parent, "rand_btn") and parent.rand_btn.isCheckable():
-            parent.rand_btn.setChecked(checked)  # keep the parent toolbar in sync
-
-    def _print_current(self):
-        # ⬇ Add this to handle fullscreen PDFs
-        if hasattr(self, "doc") and self.doc:
-            self._print_pdf()
-            return
-
-        # ⬇ Fallback: static image printing
-        if not hasattr(self, "item") or self.item is None:
-            print("No static image to print.")
-            return
-
-        printer = QPrinter(QPrinter.HighResolution)
-        dialog = QPrintDialog(printer, self)
-        if dialog.exec_() == QPrintDialog.Accepted:
-            painter = QPainter(printer)
-            pixmap = self.item.pixmap()
-            rect = painter.viewport()
-            size = pixmap.size()
-            size.scale(rect.size(), Qt.KeepAspectRatioByExpanding)
-            painter.setViewport(rect.x(), rect.y(), size.width(), size.height())
-            painter.setWindow(pixmap.rect())
-            painter.drawPixmap(0, 0, pixmap)
-            painter.end()
-
-    def _update_file_label(self):
-        """Updates the mini-menu filename label."""
-        if hasattr(self, "_file_label"):
-            self._file_label.setText(os.path.basename(self.path))
-
-    def _confirm_delete_file(self):
-        file_path = self.path
-        file_name = os.path.basename(file_path)
-
-        reply = QMessageBox.question(
-            self,
-            "Delete File",
-            f'This will delete "{file_name}" from your computer.\n'
-            f"This cannot be undone.\n\nAre you sure you want to delete this file?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-
-        if reply == QMessageBox.Yes:
-            try:
-                os.remove(file_path)
-                print(f"Deleted file: {file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to delete file:\n{str(e)}")
-                return
-
-            # Close viewer
-            self.close()
-
-            # Refresh thumbnails in MediaExplorer if callback exists
-            if self._close_callback:
-                self._close_callback()  # This should call load_directory again
-
-    def _on_viewer_closed(self, refresh=False):
-        self.viewer = None
-        if refresh:
-            self.load_directory(self.current_dir)
-
-    def _set_volume(self, value):
-        if hasattr(self, "player"):
-            self.player.setVolume(value)
-            if value == 0:
-                self.mute_btn.setChecked(True)
-            else:
-                self.mute_btn.setChecked(False)
-
-    def _toggle_mute(self):
-        if hasattr(self, "player"):
-            if self.mute_btn.isChecked():
-                self.player.setMuted(True)
-                self.mute_btn.setIcon(
-                    self.style().standardIcon(QStyle.SP_MediaVolumeMuted)
-                )
-            else:
-                self.player.setMuted(False)
-                self.mute_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
-
-    #   #This ensures the GIF always scales correctly when revisited.
-    def _update_gif_frame(self):
-        self.item.setPixmap(self.movie.currentPixmap())
-        self.view.fitInView(self.item, Qt.KeepAspectRatio)
-
-    def start_stop_slideshow(self):
-        # If no timer is running, ask the user for X seconds and start
-        if self.slideshowTimer is None:
-            # Parent=None ensures it shows on top
-            secs, ok = QInputDialog.getInt(
-                None, "Slideshow", "Seconds per slide:", 5, 1, 60
-            )
-            if not ok:
-                return
-
-            self.interval = secs * 1000
-
-            # Create a single-shot QTimer (we will manually re-arm it each time)
-            self.slideshowTimer = QTimer(self)
-            self.slideshowTimer.setSingleShot(True)
-            self.slideshowTimer.timeout.connect(self._advance_slideshow)
-            self.slideshowTimer.start(self.interval)
-
-            # Change the button text to "Stop Slideshow"
-            self._slideshow_btn.setText("Stop Slideshow")
-
-        else:
-            # If timer already exists, stop it and clear
-            self.slideshowTimer.stop()
-            self.slideshowTimer = None
-            self.interval = None  # ← Prevent it from restarting on media change
-            self._slideshow_btn.setText("Slideshow Mode")
-
-    def _advance_slideshow(self):
-        # Advance to the next index
-        if self.randomize:
-            self.idx = random.randrange(len(self.media_list))
-        else:
-            self.idx = (self.idx + 1) % len(self.media_list)
-
-        # Load the next media
-        next_path = self.media_list[self.idx]
-        self.load_media(next_path)
-
-        # Re-start the timer
-        if self.slideshowTimer is not None:
-            self.slideshowTimer.start(self.interval)
-
-    def show_page(self, idx):
-        """Render PDF page idx to exactly fill the viewport (preserving aspect)."""
-        page = self.doc[idx]
-        rect = page.rect  # width/height in points
-
-        # Get current viewport size
-        vp = self.view.viewport().size()
-        vp_w, vp_h = vp.width(), vp.height()
-
-        # Compute scale factors
-        scale_x = vp_w / rect.width
-        scale_y = vp_h / rect.height
-        scale = min(scale_x, scale_y)  # Fit within both dimensions
-
-        mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-
-        image = QImage(
-            pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
-        )
-        self.pix_item.setPixmap(QPixmap.fromImage(image))
-
-        # Center label
-        self._page_label.setText(f"Page {idx + 1} of {len(self.doc)}")
-        self._page_label.adjustSize()
-        label_x = (self.width() - self._page_label.width()) // 2
-        self._page_label.move(label_x, 20)
-
-        # Fit and center (optional, won't shrink if already correct size)
-        self.view.fitInView(self.pix_item, Qt.KeepAspectRatio)
-
-    def _advance_page(self):
-        if self.page_index < len(self.doc) - 1:
-            self.page_index += 1
-        else:
-            self.page_index = 0
-        self.show_page(self.page_index)
-
-    def _toggle_random_mode(self, checked):
-        """
-        Called when the mini-menu "Random Mode" button is clicked.
-        We simply flip our own `self.randomize` flag, so that
-        when _advance() runs, it will pick a random index if checked.
-        """
-        self.randomize = checked
-
-        # Change button text so it reads "Exit Random Mode" when active
-        self.rand_btn.setText("Exit Random" if checked else "Random Mode")
-        # If you also want to inform the parent MediaExplorer, you could do:
-        parent = self.parent()
-        if parent and hasattr(parent, "rand_btn") and parent.rand_btn.isCheckable():
-            parent.rand_btn.setChecked(checked)  # keep the parent toolbar in sync
-
-    def _print_current(self):
-        # ⬇ Add this to handle fullscreen PDFs
-        if hasattr(self, "doc") and self.doc:
-            self._print_pdf()
-            return
-
-        # ⬇ Fallback: static image printing
-        if not hasattr(self, "item") or self.item is None:
-            print("No static image to print.")
-            return
-
-        printer = QPrinter(QPrinter.HighResolution)
-        dialog = QPrintDialog(printer, self)
-        if dialog.exec_() == QPrintDialog.Accepted:
-            painter = QPainter(printer)
-            pixmap = self.item.pixmap()
-            rect = painter.viewport()
-            size = pixmap.size()
-            size.scale(rect.size(), Qt.KeepAspectRatioByExpanding)
-            painter.setViewport(rect.x(), rect.y(), size.width(), size.height())
-            painter.setWindow(pixmap.rect())
-            painter.drawPixmap(0, 0, pixmap)
-            painter.end()
+            QTimer.singleShot(10, lambda: self.view.fitInView(self.pix_item, Qt.KeepAspectRatio))
+        except Exception as e:
+            print(f"Error showing PDF page: {e}")
 
     def _print_pdf(self):
+        """Print PDF pages"""
+        from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
+        from PyQt5.QtGui import QPainter
+        
         if not hasattr(self, "doc") or not self.doc:
             return
 
-        printer = QPrinter()
+        printer = QPrinter(QPrinter.HighResolution)
         dialog = QPrintDialog(printer, self)
         if dialog.exec_() != QPrintDialog.Accepted:
             return
 
         painter = QPainter(printer)
-        for page_num in range(self.doc.pageCount()):
-            page = self.doc.page(page_num)
-            if page is None:
-                continue
-
-            image = page.renderToImage(300, 300)
-            if image.isNull():
-                continue
-
+        for page_num in range(len(self.doc)):
+            page = self.doc[page_num]
+            mat = fitz.Matrix(2.0, 2.0)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            
+            image = QImage(
+                pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
+            )
+            
             rect = painter.viewport()
             size = image.size()
             size.scale(rect.size(), Qt.KeepAspectRatio)
@@ -2463,511 +2596,24 @@ class FullscreenImageViewer(QWidget):
             painter.setWindow(image.rect())
             painter.drawImage(0, 0, image)
 
-            if page_num != self.doc.pageCount() - 1:
+            if page_num != len(self.doc) - 1:
                 printer.newPage()
 
         painter.end()
 
-    def _update_file_label(self):
-        """Updates the mini-menu filename label."""
-        if hasattr(self, "_file_label"):
-            self._file_label.setText(os.path.basename(self.path))
-
-    def _confirm_delete_file(self):
-        file_path = self.path
-        file_name = os.path.basename(file_path)
-
-        reply = QMessageBox.question(
-            self,
-            "Delete File",
-            f'This will delete "{file_name}" from your computer.\n'
-            f"This cannot be undone.\n\nAre you sure you want to delete this file?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-
-        if reply == QMessageBox.Yes:
-            try:
-                os.remove(file_path)
-                print(f"Deleted file: {file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to delete file:\n{str(e)}")
-                return
-
-            # Close viewer
-            self.close()
-
-            # Refresh thumbnails in MediaExplorer if callback exists
-            if self._close_callback:
-                self._close_callback()  # This should call load_directory again
-
-    def _on_viewer_closed(self, refresh=False):
-        self.viewer = None
-        if refresh:
-            self.load_directory(self.current_dir)
-
-    def _set_volume(self, value):
-        if hasattr(self, "player"):
-            self.player.setVolume(value)
-            if value == 0:
-                self.mute_btn.setChecked(True)
-            else:
-                self.mute_btn.setChecked(False)
-
-    def _toggle_mute(self):
-        if hasattr(self, "player"):
-            if self.mute_btn.isChecked():
-                self.player.setMuted(True)
-                self.mute_btn.setIcon(
-                    self.style().standardIcon(QStyle.SP_MediaVolumeMuted)
-                )
-            else:
-                self.player.setMuted(False)
-                self.mute_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
-
-    #   #This ensures the GIF always scales correctly when revisited.
+    # ─── GIF Methods ───
     def _update_gif_frame(self):
-        self.item.setPixmap(self.movie.currentPixmap())
-        self.view.fitInView(self.item, Qt.KeepAspectRatio)
-
-    def start_stop_slideshow(self):
-        # If no timer is running, ask the user for X seconds and start
-        if self.slideshowTimer is None:
-            # Parent=None ensures it shows on top
-            secs, ok = QInputDialog.getInt(
-                None, "Slideshow", "Seconds per slide:", 5, 1, 60
-            )
-            if not ok:
-                return
-
-            self.interval = secs * 1000
-
-            # Create a single-shot QTimer (we will manually re-arm it each time)
-            self.slideshowTimer = QTimer(self)
-            self.slideshowTimer.setSingleShot(True)
-            self.slideshowTimer.timeout.connect(self._advance_slideshow)
-            self.slideshowTimer.start(self.interval)
-
-            # Change the button text to "Stop Slideshow"
-            self._slideshow_btn.setText("Stop Slideshow")
-
-        else:
-            # If timer already exists, stop it and clear
-            self.slideshowTimer.stop()
-            self.slideshowTimer = None
-            self.interval = None  # ← Prevent it from restarting on media change
-            self._slideshow_btn.setText("Slideshow Mode")
-
-    def _advance_slideshow(self):
-        # Advance to the next index
-        if self.randomize:
-            self.idx = random.randrange(len(self.media_list))
-        else:
-            self.idx = (self.idx + 1) % len(self.media_list)
-
-        # Load the next media
-        next_path = self.media_list[self.idx]
-        self.load_media(next_path)
-
-        # Re-start the timer
-        if self.slideshowTimer is not None:
-            self.slideshowTimer.start(self.interval)
-
-    def show_page(self, idx):
-        """Render PDF page idx to exactly fill the viewport (preserving aspect)."""
-        page = self.doc[idx]
-        rect = page.rect  # width/height in points
-
-        # Get current viewport size
-        vp = self.view.viewport().size()
-        vp_w, vp_h = vp.width(), vp.height()
-
-        # Compute scale factors
-        scale_x = vp_w / rect.width
-        scale_y = vp_h / rect.height
-        scale = min(scale_x, scale_y)  # Fit within both dimensions
-
-        mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-
-        image = QImage(
-            pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
-        )
-        self.pix_item.setPixmap(QPixmap.fromImage(image))
-
-        # Center label
-        self._page_label.setText(f"Page {idx + 1} of {len(self.doc)}")
-        self._page_label.adjustSize()
-        label_x = (self.width() - self._page_label.width()) // 2
-        self._page_label.move(label_x, 20)
-
-        # Fit and center (optional, won't shrink if already correct size)
-        self.view.fitInView(self.pix_item, Qt.KeepAspectRatio)
-
-    def _advance_page(self):
-        if self.page_index < len(self.doc) - 1:
-            self.page_index += 1
-        else:
-            self.page_index = 0
-        self.show_page(self.page_index)
-
-    def _toggle_random_mode(self, checked):
-        """
-        Called when the mini-menu "Random Mode" button is clicked.
-        We simply flip our own `self.randomize` flag, so that
-        when _advance() runs, it will pick a random index if checked.
-        """
-        self.randomize = checked
-
-        # Change button text so it reads "Exit Random Mode" when active
-        self.rand_btn.setText("Exit Random" if checked else "Random Mode")
-        # If you also want to inform the parent MediaExplorer, you could do:
-        parent = self.parent()
-        if parent and hasattr(parent, "rand_btn") and parent.rand_btn.isCheckable():
-            parent.rand_btn.setChecked(checked)  # keep the parent toolbar in sync
-
-    def _print_current(self):
-        # ⬇ Add this to handle fullscreen PDFs
-        if hasattr(self, "doc") and self.doc:
-            self._print_pdf()
+        """Update GIF frame"""
+        if self._is_closing:
             return
-
-        # ⬇ Fallback: static image printing
-        if not hasattr(self, "item") or self.item is None:
-            print("No static image to print.")
-            return
-
-        printer = QPrinter(QPrinter.HighResolution)
-        dialog = QPrintDialog(printer, self)
-        if dialog.exec_() == QPrintDialog.Accepted:
-            painter = QPainter(printer)
-            pixmap = self.item.pixmap()
-            rect = painter.viewport()
-            size = pixmap.size()
-            size.scale(rect.size(), Qt.KeepAspectRatioByExpanding)
-            painter.setViewport(rect.x(), rect.y(), size.width(), size.height())
-            painter.setWindow(pixmap.rect())
-            painter.drawPixmap(0, 0, pixmap)
-            painter.end()
-
-    def _print_pdf(self):
-        if not hasattr(self, "doc") or not self.doc:
-            return
-
-        printer = QPrinter()
-        dialog = QPrintDialog(printer, self)
-        if dialog.exec_() != QPrintDialog.Accepted:
-            return
-
-        painter = QPainter(printer)
-        for page_num in range(self.doc.pageCount()):
-            page = self.doc.page(page_num)
-            if page is None:
-                continue
-
-            image = page.renderToImage(300, 300)
-            if image.isNull():
-                continue
-
-            rect = painter.viewport()
-            size = image.size()
-            size.scale(rect.size(), Qt.KeepAspectRatio)
-            painter.setViewport(rect.x(), rect.y(), size.width(), size.height())
-            painter.setWindow(image.rect())
-            painter.drawImage(0, 0, image)
-
-            if page_num != self.doc.pageCount() - 1:
-                printer.newPage()
-
-        painter.end()
-
-    def _update_file_label(self):
-        """Updates the mini-menu filename label."""
-        if hasattr(self, "_file_label"):
-            self._file_label.setText(os.path.basename(self.path))
-
-    def _confirm_delete_file(self):
-        file_path = self.path
-        file_name = os.path.basename(file_path)
-
-        reply = QMessageBox.question(
-            self,
-            "Delete File",
-            f'This will delete "{file_name}" from your computer.\n'
-            f"This cannot be undone.\n\nAre you sure you want to delete this file?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-
-        if reply == QMessageBox.Yes:
+            
+        if hasattr(self, 'item') and hasattr(self, 'movie'):
             try:
-                os.remove(file_path)
-                print(f"Deleted file: {file_path}")
+                self.item.setPixmap(self.movie.currentPixmap())
+                if hasattr(self, 'view'):
+                    self.view.fitInView(self.item, Qt.KeepAspectRatio)
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to delete file:\n{str(e)}")
-                return
-
-            # Close viewer
-            self.close()
-
-            # Refresh thumbnails in MediaExplorer if callback exists
-            if self._close_callback:
-                self._close_callback()  # This should call load_directory again
-
-    def _on_viewer_closed(self, refresh=False):
-        self.viewer = None
-        if refresh:
-            self.load_directory(self.current_dir)
-
-    def _set_volume(self, value):
-        if hasattr(self, "player"):
-            self.player.setVolume(value)
-            if value == 0:
-                self.mute_btn.setChecked(True)
-            else:
-                self.mute_btn.setChecked(False)
-
-    def _toggle_mute(self):
-        if hasattr(self, "player"):
-            if self.mute_btn.isChecked():
-                self.player.setMuted(True)
-                self.mute_btn.setIcon(
-                    self.style().standardIcon(QStyle.SP_MediaVolumeMuted)
-                )
-            else:
-                self.player.setMuted(False)
-                self.mute_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
-
-    #   #This ensures the GIF always scales correctly when revisited.
-    def _update_gif_frame(self):
-        self.item.setPixmap(self.movie.currentPixmap())
-        self.view.fitInView(self.item, Qt.KeepAspectRatio)
-
-    def start_stop_slideshow(self):
-        # If no timer is running, ask the user for X seconds and start
-        if self.slideshowTimer is None:
-            # Parent=None ensures it shows on top
-            secs, ok = QInputDialog.getInt(
-                None, "Slideshow", "Seconds per slide:", 5, 1, 60
-            )
-            if not ok:
-                return
-
-            self.interval = secs * 1000
-
-            # Create a single-shot QTimer (we will manually re-arm it each time)
-            self.slideshowTimer = QTimer(self)
-            self.slideshowTimer.setSingleShot(True)
-            self.slideshowTimer.timeout.connect(self._advance_slideshow)
-            self.slideshowTimer.start(self.interval)
-
-            # Change the button text to "Stop Slideshow"
-            self._slideshow_btn.setText("Stop Slideshow")
-
-        else:
-            # If timer already exists, stop it and clear
-            self.slideshowTimer.stop()
-            self.slideshowTimer = None
-            self.interval = None  # ← Prevent it from restarting on media change
-            self._slideshow_btn.setText("Slideshow Mode")
-
-    def _advance_slideshow(self):
-        # Advance to the next index
-        if self.randomize:
-            self.idx = random.randrange(len(self.media_list))
-        else:
-            self.idx = (self.idx + 1) % len(self.media_list)
-
-        # Load the next media
-        next_path = self.media_list[self.idx]
-        self.load_media(next_path)
-
-        # Re-start the timer
-        if self.slideshowTimer is not None:
-            self.slideshowTimer.start(self.interval)
-
-    def show_page(self, idx):
-        """Render PDF page idx to exactly fill the viewport (preserving aspect)."""
-        page = self.doc[idx]
-        rect = page.rect  # width/height in points
-
-        # Get current viewport size
-        vp = self.view.viewport().size()
-        vp_w, vp_h = vp.width(), vp.height()
-
-        # Compute scale factors
-        scale_x = vp_w / rect.width
-        scale_y = vp_h / rect.height
-        scale = min(scale_x, scale_y)  # Fit within both dimensions
-
-        mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-
-        image = QImage(
-            pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
-        )
-        self.pix_item.setPixmap(QPixmap.fromImage(image))
-
-        # Center label
-        self._page_label.setText(f"Page {idx + 1} of {len(self.doc)}")
-        self._page_label.adjustSize()
-        label_x = (self.width() - self._page_label.width()) // 2
-        self._page_label.move(label_x, 20)
-
-        # Fit and center (optional, won't shrink if already correct size)
-        self.view.fitInView(self.pix_item, Qt.KeepAspectRatio)
-
-    def _advance_page(self):
-        if self.page_index < len(self.doc) - 1:
-            self.page_index += 1
-        else:
-            self.page_index = 0
-        self.show_page(self.page_index)
-
-    def _toggle_random_mode(self, checked):
-        """
-        Called when the mini-menu "Random Mode" button is clicked.
-        We simply flip our own `self.randomize` flag, so that
-        when _advance() runs, it will pick a random index if checked.
-        """
-        self.randomize = checked
-
-        # Change button text so it reads "Exit Random Mode" when active
-        self.rand_btn.setText("Exit Random" if checked else "Random Mode")
-        # If you also want to inform the parent MediaExplorer, you could do:
-        parent = self.parent()
-        if parent and hasattr(parent, "rand_btn") and parent.rand_btn.isCheckable():
-            parent.rand_btn.setChecked(checked)  # keep the parent toolbar in sync
-
-    def _print_current(self):
-        # ⬇ Add this to handle fullscreen PDFs
-        if hasattr(self, "doc") and self.doc:
-            self._print_pdf()
-            return
-
-        # ⬇ Fallback: static image printing
-        if not hasattr(self, "item") or self.item is None:
-            print("No static image to print.")
-            return
-
-        printer = QPrinter(QPrinter.HighResolution)
-        dialog = QPrintDialog(printer, self)
-        if dialog.exec_() == QPrintDialog.Accepted:
-            painter = QPainter(printer)
-            pixmap = self.item.pixmap()
-            rect = painter.viewport()
-            size = pixmap.size()
-            size.scale(rect.size(), Qt.KeepAspectRatioByExpanding)
-            painter.setViewport(rect.x(), rect.y(), size.width(), size.height())
-            painter.setWindow(pixmap.rect())
-            painter.drawPixmap(0, 0, pixmap)
-            painter.end()
-
-    def _print_pdf(self):
-        if not hasattr(self, "doc") or not self.doc:
-            return
-
-        printer = QPrinter()
-        dialog = QPrintDialog(printer, self)
-        if dialog.exec_() != QPrintDialog.Accepted:
-            return
-
-        painter = QPainter(printer)
-        for page_num in range(self.doc.pageCount()):
-            page = self.doc.page(page_num)
-            if page is None:
-                continue
-
-            image = page.renderToImage(300, 300)
-            if image.isNull():
-                continue
-
-            rect = painter.viewport()
-            size = image.size()
-            size.scale(rect.size(), Qt.KeepAspectRatio)
-            painter.setViewport(rect.x(), rect.y(), size.width(), size.height())
-            painter.setWindow(image.rect())
-            painter.drawImage(0, 0, image)
-
-            if page_num != self.doc.pageCount() - 1:
-                printer.newPage()
-
-        painter.end()
-
-    def _update_file_label(self):
-        """Updates the mini-menu filename label."""
-        if hasattr(self, "_file_label"):
-            self._file_label.setText(os.path.basename(self.path))
-
-    def _confirm_delete_file(self):
-        file_path = self.path
-        file_name = os.path.basename(file_path)
-
-        reply = QMessageBox.question(
-            self,
-            "Delete File",
-            f'This will delete "{file_name}" from your computer.\n'
-            f"This cannot be undone.\n\nAre you sure you want to delete this file?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-
-        if reply == QMessageBox.Yes:
-            try:
-                os.remove(file_path)
-                print(f"Deleted file: {file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to delete file:\n{str(e)}")
-                return
-
-            # Close viewer
-            self.close()
-
-            # Refresh thumbnails in MediaExplorer if callback exists
-            if self._close_callback:
-                self._close_callback()  # This should call load_directory again
-
-    def _on_viewer_closed(self, refresh=False):
-        self.viewer = None
-        if refresh:
-            self.load_directory(self.current_dir)
-
-    def _set_volume(self, value):
-        if hasattr(self, "player"):
-            self.player.setVolume(value)
-            if value == 0:
-                self.mute_btn.setChecked(True)
-            else:
-                self.mute_btn.setChecked(False)
-
-    def _toggle_mute(self):
-        if hasattr(self, "player"):
-            if self.mute_btn.isChecked():
-                self.player.setMuted(True)
-                self.mute_btn.setIcon(
-                    self.style().standardIcon(QStyle.SP_MediaVolumeMuted)
-                )
-            else:
-                self.player.setMuted(False)
-                self.mute_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
-
-    def resizeEvent(self, ev):
-        super().resizeEvent(ev)
-        # keep arrow pinned top-right
-        self._mini_arrow.move(self.width() - self._mini_arrow.width() - 10, 10)
-        # Reposition navigation arrows
-        self._position_nav_buttons()
-        # Keep loading indicator centered
-        self._center_loading_indicator()
-        # if menu is open, keep it flush with right edge
-        if self._mini_open:
-            self._mini_menu.move(self.width() - self._mini_menu.width(), 0)
-
-    def _position_nav_buttons(self):
-        btn_w, btn_h = 60, 60
-        y = (self.height() - btn_h) // 2
-        self.left_nav_btn.setGeometry(20, y, btn_w, btn_h)
-        self.right_nav_btn.setGeometry(self.width() - btn_w - 20, y, btn_w, btn_h)
-        self.left_nav_btn.raise_()
-        self.right_nav_btn.raise_()
-
+                print(f"Error updating GIF frame: {e}")
 
 # -----------------------------------------------------------------------------
 # Thumbnail Cropper
@@ -4369,7 +4015,7 @@ class MediaExplorer(QWidget):
             slideshowInterval=self._lastInterval if self.slideshowActive else None,
             randomize=False,
             toggle_slideshow_callback=self.toggle_slideshow_mode,
-            close_callback=lambda: self._on_viewer_closed(),
+            close_callback=self._on_viewer_closed,
         )
         self.viewer.showFullScreen()
 
